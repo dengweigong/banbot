@@ -1,7 +1,15 @@
 package live
 
 import (
+	"errors"
+	"github.com/banbox/banbot/biz"
+	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/orm"
+	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banexg/bntp"
+	"github.com/banbox/banexg/log"
+	"github.com/banbox/banexg/utils"
+	"go.uber.org/zap"
 	"strings"
 	"time"
 
@@ -15,12 +23,97 @@ import (
 func regApiPub(api fiber.Router) {
 	api.Post("/login", postLogin)
 	api.Get("/ping", getPing)
+	api.Post("/strat_call", postStratCall)
 }
 
 func getPing(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{
 		"status": "pong",
 	})
+}
+
+func postStratCall(c *fiber.Ctx) error {
+	var req = make(map[string]interface{})
+	if err := utils.Unmarshal(c.Body(), &req, utils.JsonNumAuto); err != nil {
+		return err
+	}
+	token := utils.PopMapVal(req, "token", "")
+	if token == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "token required")
+	}
+	users := config.GetApiUsers()
+	clientIP := c.IP()
+	var user *config.UserConfig
+	for _, u := range users {
+		if u.Password == token {
+			if len(u.AllowIPs) == 0 || utils.ArrContains(u.AllowIPs, clientIP) {
+				user = u
+			} else {
+				return fiber.NewError(fiber.StatusUnauthorized, "unauthorized from ip: "+clientIP)
+			}
+			break
+		}
+	}
+	if user == nil {
+		return fiber.NewError(fiber.StatusUnauthorized, "unauthorized token")
+	}
+	strategy := utils.PopMapVal(req, "strategy", "")
+	if strategy == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "strategy required")
+	}
+	client := &core.ApiClient{
+		IP:        clientIP,
+		UserAgent: c.Get("User-Agent"),
+		User:      user.Username,
+		AccRoles:  user.AccRoles,
+		Token:     token,
+	}
+	jobs := make(map[string]map[string]*strat.StratJob)
+	var stg *strat.TradeStrat
+	for acc := range client.AccRoles {
+		jobMap := strat.GetJobs(acc)
+		items := make(map[string]*strat.StratJob)
+		for pairTf, m := range jobMap {
+			if job, ok := m[strategy]; ok {
+				items[pairTf] = job
+				if stg == nil {
+					stg = job.Strat
+				}
+			}
+		}
+		if len(items) > 0 {
+			jobs[acc] = items
+		}
+	}
+	if stg == nil {
+		return errors.New("no job running with strategy: " + strategy)
+	}
+	if stg.OnPostApi != nil {
+		err_ := stg.OnPostApi(client, req, jobs)
+		if err_ != nil {
+			log.Warn("OnPostApi fail", zap.String("strategy", strategy), zap.Any("msg", req), zap.Error(err_))
+		} else {
+			sess, conn, err := ormo.Conn(orm.DbTrades, true)
+			if err != nil {
+				log.Error("get db sess fail", zap.Error(err))
+				return err
+			}
+			defer conn.Close()
+			for acc, jobMap := range jobs {
+				odMgr := biz.GetOdMgr(acc)
+				for _, job := range jobMap {
+					_, _, err = odMgr.ProcessOrders(sess, job)
+					if err != nil {
+						log.Error("process orders fail", zap.String("acc", acc), zap.Error(err))
+						return err
+					}
+				}
+			}
+		}
+		return err_
+	} else {
+		return errors.New("OnPostApi not implement for strategy: " + strategy)
+	}
 }
 
 func postLogin(c *fiber.Ctx) error {
@@ -33,10 +126,14 @@ func postLogin(c *fiber.Ctx) error {
 		return err
 	}
 
+	clientIP := c.IP()
 	users := config.GetApiUsers()
 	for _, u := range users {
 		if u.Username != req.Username || u.Password != req.Password {
 			continue
+		}
+		if len(u.AllowIPs) > 0 && !utils.ArrContains(u.AllowIPs, clientIP) {
+			return fiber.NewError(fiber.StatusUnauthorized, "unauthorized from ip: "+clientIP)
 		}
 		expHours := u.ExpireHours
 		if expHours == 0 {
@@ -57,6 +154,7 @@ func postLogin(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{
 			"name":     config.Name,
 			"token":    token,
+			"env":      core.RunEnv,
 			"accounts": u.AccRoles,
 		})
 	}
@@ -105,9 +203,13 @@ func AuthMiddleware(secret string) fiber.Handler {
 		if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
 			user := claims["user"]
 			c.Locals("user", user)
+			clientIP := c.IP()
 			users := config.GetApiUsers()
 			for _, u := range users {
 				if u.Username == user {
+					if len(u.AllowIPs) > 0 && !utils.ArrContains(u.AllowIPs, clientIP) {
+						return fiber.NewError(fiber.StatusUnauthorized, "unauthorized from ip: "+clientIP)
+					}
 					c.Locals("accounts", u.AccRoles)
 					break
 				}

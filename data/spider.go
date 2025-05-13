@@ -11,13 +11,15 @@ import (
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	utils2 "github.com/banbox/banexg/utils"
+	"github.com/sasha-s/go-deadlock"
 	"go.uber.org/zap"
 	"strings"
 	"time"
 )
 
 var (
-	Spider *LiveSpider
+	Spider     *LiveSpider
+	retryWaits = btime.NewRetryWaits(0, nil)
 )
 
 type NotifyKLines struct {
@@ -140,19 +142,131 @@ type Miner struct {
 	Market       string
 	exchange     banexg.BanExchange
 	Fetchs       map[string]*FetchJob
-	KlineReady   bool
-	KlinePairs   map[string]bool
-	TradeReady   bool
-	TradePairs   map[string]bool
-	BookReady    bool
-	BookPairs    map[string]bool
+	KLines       *PairSubs
+	Trades       *PairSubs
+	Depths       *PairSubs
 	IsWatchPrice bool
 	klineStates  map[string]*SubKLineState
+}
+
+type PairSubs struct {
+	pairs  map[string]bool
+	m      deadlock.Mutex
+	Status int // 0 not subscribed, 1 subscribing, 2 subscribed
+}
+
+func NewPairSubs() *PairSubs {
+	return &PairSubs{
+		pairs: make(map[string]bool),
+	}
+}
+
+// GetNewSubs get pairs need to be subscribed
+func (s *PairSubs) GetNewSubs(pairs []string) []string {
+	if s.Status == 0 {
+		// 未订阅，返回全部品种
+		if len(pairs) > 0 {
+			s.Set(pairs...)
+		}
+		pairs = s.Keys()
+		if len(pairs) > 0 {
+			s.Status = 1
+		}
+		return pairs
+	} else {
+		// 正在订阅，返回新的尚未订阅品种
+		return s.Set(pairs...)
+	}
+}
+
+func (s *PairSubs) Set(pairs ...string) []string {
+	s.m.Lock()
+	res := make([]string, 0, len(pairs))
+	for _, p := range pairs {
+		if _, ok := s.pairs[p]; !ok {
+			s.pairs[p] = true
+			res = append(res, p)
+		}
+	}
+	s.m.Unlock()
+	return res
+}
+
+func (s *PairSubs) Remove(pairs ...string) []string {
+	s.m.Lock()
+	res := make([]string, 0, len(pairs))
+	for _, p := range pairs {
+		if _, ok := s.pairs[p]; ok {
+			delete(s.pairs, p)
+			res = append(res, p)
+		}
+	}
+	s.m.Unlock()
+	return res
+}
+
+func (s *PairSubs) Len() int {
+	s.m.Lock()
+	l := len(s.pairs)
+	s.m.Unlock()
+	return l
+}
+
+func (s *PairSubs) Keys() []string {
+	s.m.Lock()
+	keys := utils.KeysOfMap(s.pairs)
+	s.m.Unlock()
+	return keys
 }
 
 type LiveSpider struct {
 	*utils.ServerIO
 	miners map[string]*Miner
+}
+
+// monitorSubscriptions periodically checks all miners for failed subscriptions and restarts them
+func (s *LiveSpider) monitorSubscriptions() {
+	log.Info("Starting subscription monitor")
+	for {
+		time.Sleep(time.Second * 1)
+
+		// Check all miners for failed subscriptions
+		for key, miner := range s.miners {
+			curMS := btime.UTCStamp()
+			// Check KLine subscriptions
+			klineNum := miner.KLines.Len()
+			if klineNum > 0 && miner.KLines.Status == 0 && curMS > retryWaits.NextRetry("watchKLines") {
+				log.Info("Recovering KLine subscription",
+					zap.String("miner", key),
+					zap.Int("pairs", klineNum))
+				miner.watchKLines(nil)
+			}
+
+			// Check Trade subscriptions
+			tradeNum := miner.Trades.Len()
+			if tradeNum > 0 && miner.Trades.Status == 0 && curMS > retryWaits.NextRetry("watchTrades") {
+				log.Info("Recovering Trade subscription",
+					zap.String("miner", key),
+					zap.Int("pairs", tradeNum))
+				miner.watchTrades(nil)
+			}
+
+			// Check OrderBook subscriptions
+			bookNum := miner.Depths.Len()
+			if bookNum > 0 && miner.Depths.Status == 0 && curMS > retryWaits.NextRetry("watchOdBooks") {
+				log.Info("Recovering OrderBook subscription",
+					zap.String("miner", key),
+					zap.Int("pairs", bookNum))
+				miner.watchOdBooks(nil)
+			}
+
+			// Check Price subscriptions for contract markets
+			if miner.exchange.IsContract(miner.Market) && !miner.IsWatchPrice && curMS > retryWaits.NextRetry("watchPrices") {
+				log.Info("Recovering Price subscription", zap.String("miner", key))
+				miner.watchPrices()
+			}
+		}
+	}
 }
 
 func newMiner(spider *LiveSpider, exgName, market string) (*Miner, *errs.Error) {
@@ -166,9 +280,9 @@ func newMiner(spider *LiveSpider, exgName, market string) (*Miner, *errs.Error) 
 		Market:      market,
 		exchange:    exchange,
 		Fetchs:      map[string]*FetchJob{},
-		KlinePairs:  map[string]bool{},
-		TradePairs:  map[string]bool{},
-		BookPairs:   map[string]bool{},
+		KLines:      NewPairSubs(),
+		Trades:      NewPairSubs(),
+		Depths:      NewPairSubs(),
 		klineStates: map[string]*SubKLineState{},
 	}, nil
 }
@@ -222,21 +336,24 @@ func (m *Miner) SubPairs(jobType string, pairs ...string) *errs.Error {
 
 func (m *Miner) UnSubPairs(jobType string, pairs ...string) *errs.Error {
 	if jobType == "ws" || jobType == "book" {
-		return m.exchange.UnWatchOrderBooks(pairs, nil)
+		removes := m.Depths.Remove(pairs...)
+		return m.exchange.UnWatchOrderBooks(removes, nil)
 	} else if jobType == "ohlcv" || jobType == "uohlcv" {
-		jobs := make([][2]string, len(m.KlinePairs))
 		timeFrame := "1s"
 		if banexg.IsContract(m.Market) {
 			timeFrame = "1m"
 		}
-		for p := range m.KlinePairs {
+		items := m.KLines.Remove(pairs...)
+		jobs := make([][2]string, len(items))
+		for _, p := range items {
 			jobs = append(jobs, [2]string{p, timeFrame})
 		}
 		return m.exchange.UnWatchOHLCVs(jobs, nil)
 	} else if jobType == "price" {
 		return m.exchange.UnWatchMarkPrices(nil, nil)
 	} else if jobType == "trade" {
-		return m.exchange.UnWatchTrades(pairs, nil)
+		items := m.Trades.Remove(pairs...)
+		return m.exchange.UnWatchTrades(items, nil)
 	} else {
 		log.Error("unknown unsub type", zap.String("val", jobType))
 	}
@@ -244,31 +361,30 @@ func (m *Miner) UnSubPairs(jobType string, pairs ...string) *errs.Error {
 }
 
 func (m *Miner) watchTrades(pairs []string) {
+	pairs = m.Trades.GetNewSubs(pairs)
 	if len(pairs) == 0 {
 		return
 	}
-	for _, p := range pairs {
-		m.TradePairs[p] = true
-	}
-	allPairs := utils.KeysOfMap(m.TradePairs)
-	out, err := m.exchange.WatchTrades(allPairs, nil)
+	out, err := m.exchange.WatchTrades(pairs, nil)
 	if err != nil {
+		m.Trades.Status = 0
+		retryWaits.SetFail("watchTrades")
 		log.Error("watch trades fail", zap.String("exg", m.ExgName), zap.Error(err))
 		return
 	}
-	if m.TradeReady {
+	retryWaits.Reset("watchTrades")
+	if m.Trades.Status == 2 {
 		return
 	}
-	m.TradeReady = true
-	log.Info("start watch trades", zap.String("exg", m.ExgName), zap.Int("num", len(m.TradePairs)))
+	m.Trades.Status = 2
+	log.Info("start watch trades", zap.String("exg", m.ExgName), zap.Int("num", m.Trades.Len()))
 	prefix := fmt.Sprintf("trade_%s_%s_", m.ExgName, m.Market)
 
 	go func() {
 		defer func() {
-			m.TradeReady = false
-			log.Info("watch trades stopped, retry after 3s", zap.String("exg", m.ExgName))
-			time.Sleep(time.Millisecond * 3200)
-			m.watchTrades(utils.KeysOfMap(m.TradePairs))
+			m.Trades.Status = 0
+			retryWaits.SetFail("watchTrades")
+			log.Info("watch trades stopped", zap.String("exg", m.ExgName))
 		}()
 		for item := range out {
 			err = m.spider.Broadcast(&utils.IOMsg{
@@ -290,9 +406,12 @@ func (m *Miner) watchPrices() {
 		banexg.ParamInterval: "1s",
 	})
 	if err != nil {
+		m.IsWatchPrice = false
+		retryWaits.SetFail("watchPrices")
 		log.Error("watch prices fail", zap.String("exg", m.ExgName), zap.Error(err))
 		return
 	}
+	retryWaits.Reset("watchPrices")
 	m.IsWatchPrice = true
 	log.Info("start watch prices", zap.String("exg", m.ExgName))
 	prefix := fmt.Sprintf("price_%s_%s", m.ExgName, m.Market)
@@ -300,9 +419,8 @@ func (m *Miner) watchPrices() {
 	go func() {
 		defer func() {
 			m.IsWatchPrice = false
-			log.Info("watch prices stopped, retry after 3s", zap.String("exg", m.ExgName))
-			time.Sleep(time.Millisecond * 2900)
-			m.watchPrices()
+			retryWaits.SetFail("watchPrices")
+			log.Info("watch prices stopped", zap.String("exg", m.ExgName))
 		}()
 		for item := range out {
 			err = m.spider.Broadcast(&utils.IOMsg{
@@ -317,31 +435,30 @@ func (m *Miner) watchPrices() {
 }
 
 func (m *Miner) watchOdBooks(pairs []string) {
+	pairs = m.Depths.GetNewSubs(pairs)
 	if len(pairs) == 0 {
 		return
 	}
-	for _, p := range pairs {
-		m.BookPairs[p] = true
-	}
-	allPairs := utils.KeysOfMap(m.BookPairs)
-	out, err := m.exchange.WatchOrderBooks(allPairs, 0, nil)
+	out, err := m.exchange.WatchOrderBooks(pairs, 0, nil)
 	if err != nil {
+		m.Depths.Status = 0
+		retryWaits.SetFail("watchOdBooks")
 		log.Error("watch odBook fail", zap.String("exg", m.ExgName), zap.Error(err))
 		return
 	}
-	if m.BookReady {
+	retryWaits.Reset("watchOdBooks")
+	if m.Depths.Status == 2 {
 		return
 	}
-	m.BookReady = true
-	log.Info("start watch odBooks", zap.String("exg", m.ExgName), zap.Int("num", len(m.BookPairs)))
+	m.Depths.Status = 2
+	log.Info("start watch odBooks", zap.String("exg", m.ExgName), zap.Int("num", m.Depths.Len()))
 	prefix := fmt.Sprintf("book_%s_%s_", m.ExgName, m.Market)
 
 	go func() {
 		defer func() {
-			m.BookReady = false
-			log.Info("watch odBook stopped, retry after 3s", zap.String("exg", m.ExgName))
-			time.Sleep(time.Second * 3)
-			m.watchOdBooks(utils.KeysOfMap(m.BookPairs))
+			m.Depths.Status = 0
+			retryWaits.SetFail("watchOdBooks")
+			log.Info("watch odBook stopped", zap.String("exg", m.ExgName))
 		}()
 		for book := range out {
 			err = m.spider.Broadcast(&utils.IOMsg{
@@ -366,13 +483,11 @@ type SubKLineState struct {
 这里将订阅此市场的最小周期(1s/1m)；1h/1d等大周期已在writeQ消费端判断并fetch
 */
 func (m *Miner) watchKLines(pairs []string) {
+	pairs = m.KLines.GetNewSubs(pairs)
 	if len(pairs) == 0 {
 		return
 	}
-	for _, p := range pairs {
-		m.KlinePairs[p] = true
-	}
-	jobs := make([][2]string, 0, len(m.KlinePairs))
+	jobs := make([][2]string, 0, len(pairs))
 	timeFrame := "1s"
 	if banexg.IsContract(m.Market) {
 		timeFrame = "1m"
@@ -380,7 +495,7 @@ func (m *Miner) watchKLines(pairs []string) {
 	tfSecs := utils2.TFToSecs(timeFrame)
 	tfMSecs := int64(tfSecs * 1000)
 	expectMS := utils2.AlignTfMSecs(btime.TimeMS(), tfMSecs)
-	for p := range m.KlinePairs {
+	for _, p := range pairs {
 		jobs = append(jobs, [2]string{p, timeFrame})
 		if _, ok := m.klineStates[p]; !ok {
 			exs, err := orm.GetExSymbol(m.exchange, p)
@@ -398,15 +513,18 @@ func (m *Miner) watchKLines(pairs []string) {
 	}
 	out, err := m.exchange.WatchOHLCVs(jobs, nil)
 	if err != nil {
+		m.KLines.Status = 0
+		retryWaits.SetFail("watchKLines")
 		log.Error("watch kline fail", zap.String("exg", m.ExgName),
 			zap.Strings("pairs", pairs), zap.Error(err))
 		return
 	}
-	if m.KlineReady {
+	retryWaits.Reset("watchKLines")
+	if m.KLines.Status == 2 {
 		return
 	}
-	m.KlineReady = true
-	log.Info("start watch kline", zap.String("exg", m.ExgName), zap.Int("num", len(m.KlinePairs)))
+	m.KLines.Status = 2
+	log.Info("start watch kline", zap.String("exg", m.ExgName), zap.Int("num", m.KLines.Len()))
 	prefix := fmt.Sprintf("ohlcv_%s_%s_", m.ExgName, m.Market)
 	unPrefix := "u" + prefix
 	intvMa := core.NewEMA(0.1)
@@ -490,10 +608,9 @@ func (m *Miner) watchKLines(pairs []string) {
 	pricePrefix := fmt.Sprintf("price_%s_%s", m.ExgName, m.Market)
 	go func() {
 		defer func() {
-			m.KlineReady = false
-			log.Info("watch kline stopped, retry after 3s", zap.String("exg", m.ExgName))
-			time.Sleep(time.Millisecond * 3100)
-			m.watchKLines(utils.KeysOfMap(m.KlinePairs))
+			m.KLines.Status = 0
+			retryWaits.SetFail("watchKLines")
+			log.Info("watch kline stopped", zap.String("exg", m.ExgName))
 		}()
 		for {
 			first := <-out
@@ -599,6 +716,10 @@ func RunSpider(addr string) *errs.Error {
 		return err
 	}
 	conn.Release()
+
+	// Start the subscription monitor goroutine
+	go Spider.monitorSubscriptions()
+
 	return Spider.RunForever()
 }
 

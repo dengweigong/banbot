@@ -34,6 +34,7 @@ func CronRefreshPairs(dp data.IProvider) {
 			if curMS-lastRefreshMS < config.MinPairCronGapMS {
 				return
 			}
+			log.Info("CronRefreshPairs")
 			lastRefreshMS = curMS
 			err := opt.RefreshPairJobs(dp, true, false, nil)
 			if err != nil {
@@ -134,7 +135,7 @@ func CronKlineDelays() {
 			fails[timeoutMin] = append(arr, pair)
 		}
 		if len(fails) > 0 {
-			failText := core.GroupByPairQuotes(fails)
+			failText := core.GroupByPairQuotes(fails, false)
 			logDelay("Listen to the spider kline timeout:" + failText)
 		}
 	})
@@ -160,7 +161,7 @@ func CronKlineSummary() {
 			core.TfPairHits[tf] = make(map[string]int)
 		}
 		if len(pairGroups) > 0 {
-			staText := core.GroupByPairQuotes(pairGroups)
+			staText := core.GroupByPairQuotes(pairGroups, true)
 			log.Info(fmt.Sprintf("receive bars in 10 mins:\n%s", staText))
 		}
 		core.TfPairHitsLock.Unlock()

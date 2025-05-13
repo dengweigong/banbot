@@ -59,10 +59,22 @@ func VerifyArg(c *fiber.Ctx, out interface{}, from int) error {
 }
 
 func Validate(data interface{}) *BadFields {
-	err := val.Struct(data)
-	if err != nil {
+	errArr := val.Struct(data)
+	if errArr != nil {
+		var ive *validator.InvalidValidationError
+		if errors.As(errArr, &ive) {
+			return &BadFields{
+				Items: []*BadField{
+					{
+						Field: "invalid",
+						Tag:   "invalid",
+						Value: ive.Error(),
+					},
+				},
+			}
+		}
 		var fields []*BadField
-		for _, err := range err.(validator.ValidationErrors) {
+		for _, err := range errArr.(validator.ValidationErrors) {
 			var elem BadField
 			elem.Field = err.Field()
 			elem.Tag = err.Tag()

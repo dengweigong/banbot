@@ -104,13 +104,14 @@ delete from khole where sid=%v;`, sid, sid, sid, sid, sid, sid, sid, sid))
 	conn.Release()
 	core.SetRunMode(core.RunModeBackTest)
 	tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
+	exs := orm.GetSymbolByID(sid)
 	for i, bar := range arr {
 		btime.CurTimeMS = bar.Time + tfMSecs
 		sess, conn, err = orm.Conn(nil)
 		if err != nil {
 			panic(err)
 		}
-		_, err = sess.InsertKLinesAuto(timeFrame, sid, []*banexg.Kline{bar}, true)
+		_, err = sess.InsertKLinesAuto(timeFrame, exs, []*banexg.Kline{bar}, true)
 		conn.Release()
 		if i == 8 {
 			break

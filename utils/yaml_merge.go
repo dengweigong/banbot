@@ -10,7 +10,7 @@ import (
 )
 
 var (
-	commentRe   = regexp.MustCompile(`(\s+|\b)#[^\n]*`)
+	commentRe   = regexp.MustCompile(`(\s+|\b|^)#[^\n]*`)
 	emptyLineRe = regexp.MustCompile(`\n(\s*\n)+`)
 	keyStartRe  = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]`)
 	commaRe     = regexp.MustCompile(`:($|\s)`)

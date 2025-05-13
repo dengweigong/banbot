@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"github.com/banbox/banexg/log"
 	"github.com/sasha-s/go-deadlock"
 
 	"github.com/banbox/banexg"
@@ -12,7 +13,7 @@ var (
 	RunMode       string                               // live / backtest / other
 	RunEnv        string                               // prod / test / dry_run
 	StartAt       int64                                // start timestamp(13 digits) 启动时间，13位时间戳
-	EnvReal       bool                                 // Whether to actually submit the order to the exchange(run_env:prod/test) 是否是提交到交易所真实订单模式run_env:prod/test
+	EnvReal       bool                                 // LiveMode && RunEnv != RunEnvDryRun submit the order to the exchange(run_env:prod/test) 提交订单到交易所run_env:prod/test
 	LiveMode      bool                                 // Whether real-time mode(real trade/dry run) 是否是实时模式：实盘+模拟运行
 	BackTestMode  bool                                 // 回测模式
 	TFSecs        map[string]int                       // All time frames involved 所有涉及的时间周期
@@ -38,13 +39,17 @@ var (
 	Cron          = cron.New(cron.WithSeconds())       // Use cron to run tasks regularly 使用cron定时运行任务
 
 	ExitCalls []func() // CALLBACK TO STOP EXECUTION 停止执行的回调
+	CapOut    *log.OutCapture
 
 	CPUProfile bool
 	MemProfile bool
 
+	SimOrderMatch bool // 是否正处于回测订单撮合
+	NewNumInSim   int  // 撮合时创建新订单的数量
+
 	ConcurNum = 2 // The maximum number of K-line tasks to be downloaded at the same time. If it is too high, a 429 current limit will occur. 最大同时下载K线任务数，过大会出现429限流
-	Version   = "v0.2.12"
-	UIVersion = "v0.2.12"
+	Version   = "v0.2.16"
+	UIVersion = "v0.2.16"
 	SysLang   string // language code for current system 当前系统语言设置
 	LogFile   string
 	DevDbPath string
@@ -57,7 +62,7 @@ const (
 )
 
 const (
-	MinStakeAmount = 10 // Minimum billing amount 最小开单金额
+	MinStakeAmount = 5.5 // Minimum billing amount 最小开单金额
 	StepTotal      = 1000
 	KBatchSize     = 900 // The maximum number of K lines returned by the exchange in a single request. When 1000, the API weight is too large. 单次请求交易所最大返回K线数量, 1000时api权重过大
 	DefaultDateFmt = "2006-01-02 15:04:05"

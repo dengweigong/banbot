@@ -98,6 +98,12 @@ func GetExSymbol(exchange banexg.BanExchange, symbol string) (*ExSymbol, *errs.E
 	return item, nil
 }
 
+func GetExSymbol2(exgName, market, symbol string) *ExSymbol {
+	key := fmt.Sprintf("%s:%s:%s", exgName, market, symbol)
+	item, _ := keySymbolMap[key]
+	return item
+}
+
 func EnsureExgSymbols(exchange banexg.BanExchange) *errs.Error {
 	_, err := LoadMarkets(exchange, false)
 	if err != nil {
@@ -328,6 +334,15 @@ func (s *ExSymbol) ToShort() string {
 	}
 }
 
+func (s *ExSymbol) InfoBy() string {
+	if s.Exchange == "china" && s.Market != banexg.MarketSpot {
+		// 中国非股票现货市场，K线的info字段存储持仓量，使用last归集
+		return "last"
+	}
+	// 加密货币，info存储主动买入量，使用sum归集
+	return "sum"
+}
+
 func InitListDates() *errs.Error {
 	sess, conn, err := Conn(context.Background())
 	if err != nil {
@@ -416,7 +431,7 @@ func EnsureListDates(sess *Queries, exchange banexg.BanExchange, exsMap map[int3
 		if hasFetch {
 			klines, err = exchange.FetchOHLCV(exs.Symbol, "1m", startMS, 1, nil)
 		} else {
-			klines, err = sess.QueryOHLCV(exs.ID, "1m", startMS, 0, 1, false)
+			klines, err = sess.QueryOHLCV(exs, "1m", startMS, 0, 1, false)
 		}
 		if err != nil {
 			return err

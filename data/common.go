@@ -109,7 +109,8 @@ func trySaveKlines(job *SaveKline, tfSecs int, mntSta *periodSta, hourSta *perio
 				addBars = addBars[cutIdx:]
 			}
 			if err == nil && len(addBars) > 0 {
-				_, err = sess.InsertKLinesAuto(job.TimeFrame, sid, addBars, true)
+				exs := orm.GetSymbolByID(sid)
+				_, err = sess.InsertKLinesAuto(job.TimeFrame, exs, addBars, true)
 				if err == nil {
 					savedNewBars = true
 					mntSta.reset(sid, endMS)
@@ -156,7 +157,7 @@ func downKlineTo(sess *orm.Queries, sid int32, tf string, oldEndMS, toEndMS int6
 			_, oldEndMS = sess.GetKlineRange(sid, tf)
 			return oldEndMS, err
 		}
-		saveBars, err := sess.QueryOHLCV(exs.ID, tf, 0, 0, 1, false)
+		saveBars, err := sess.QueryOHLCV(exs, tf, 0, 0, 1, false)
 		if err != nil {
 			_, oldEndMS = sess.GetKlineRange(sid, tf)
 			return oldEndMS, err
@@ -194,7 +195,11 @@ func (j *PairTFCache) fillLacks(pair string, subTfSecs int, startMS, endMS int64
 	fetchTF := utils2.SecsToTF(subTfSecs)
 	tfMSecs := int64(j.TFSecs * 1000)
 	bigStartMS := utils2.AlignTfMSecs(j.NextMS, tfMSecs)
-	_, preBars, err := autoFetchOhlcv(pair, fetchTF, bigStartMS, startMS)
+	exs, err := orm.GetExSymbolCur(pair)
+	if err != nil {
+		return nil, err
+	}
+	_, preBars, err := autoFetchOhlcv(exs, fetchTF, bigStartMS, startMS)
 	if err != nil {
 		return nil, err
 	}
@@ -202,7 +207,7 @@ func (j *PairTFCache) fillLacks(pair string, subTfSecs int, startMS, endMS int64
 	j.WaitBar = nil
 	if len(preBars) > 0 {
 		fromTFMS := int64(subTfSecs * 1000)
-		oldBars, _ := utils.BuildOHLCV(preBars, tfMSecs, 0, nil, fromTFMS, j.AlignOffMS)
+		oldBars, _ := utils.BuildOHLCV(preBars, tfMSecs, 0, nil, fromTFMS, j.AlignOffMS, exs.InfoBy())
 		if len(oldBars) > 0 {
 			j.WaitBar = oldBars[len(oldBars)-1]
 			doneBars = oldBars[:len(oldBars)-1]
@@ -212,11 +217,7 @@ func (j *PairTFCache) fillLacks(pair string, subTfSecs int, startMS, endMS int64
 	return doneBars, nil
 }
 
-func autoFetchOhlcv(pair, tf string, startMS, endMS int64) ([]*orm.AdjInfo, []*banexg.Kline, *errs.Error) {
-	exs, err := orm.GetExSymbolCur(pair)
-	if err != nil {
-		return nil, nil, err
-	}
+func autoFetchOhlcv(exs *orm.ExSymbol, tf string, startMS, endMS int64) ([]*orm.AdjInfo, []*banexg.Kline, *errs.Error) {
 	exchange := exg.Default
 	if !exchange.HasApi(banexg.ApiFetchOHLCV, exs.Market) {
 		// Downloading K lines is currently not allowed, skip

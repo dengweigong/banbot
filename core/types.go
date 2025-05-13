@@ -57,3 +57,11 @@ type FloatText struct {
 	Text string
 	Val  float64
 }
+
+type ApiClient struct {
+	IP        string
+	UserAgent string
+	User      string
+	AccRoles  map[string]string
+	Token     string
+}

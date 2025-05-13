@@ -43,7 +43,7 @@ func (s *TradeStrat) pickTimeFrame(symbol string, tfScores map[string]float64) s
 	}
 	// 过滤当前需要的时间周期
 	useTfs := make(map[string]bool)
-	tfList := s.AllowTFs
+	tfList := s.RunTimeFrames
 	if len(s.Policy.RunTimeframes) > 0 {
 		tfList = s.Policy.RunTimeframes
 	}
@@ -148,7 +148,7 @@ func (s *StratJob) OpenOrder(req *EnterReq) *errs.Error {
 					symbol, reqAmt/avgVol, config.OpenVolRate, req.LegalCost))
 			}
 		}
-		minCost := float64(core.MinStakeAmount)
+		minCost := core.MinStakeAmount
 		if req.LegalCost < minCost {
 			rate := req.LegalCost / minCost
 			if config.LowCostAction == core.LowCostKeepBig && rate > 0.4 || config.LowCostAction == core.LowCostKeepAll {
@@ -479,9 +479,16 @@ func (s *StratJob) setAllExitTrigger(dirt float64, key string, args *ormo.ExitTr
 		panic(fmt.Sprintf("%v SetAll%s.dirt should be 1/-1 when both long/short orders exists!", s.Strat.Name, key))
 	}
 	odList := s.GetOrders(dirt)
+	if args == nil {
+		// 取消所有止盈或止损
+		for _, od := range odList {
+			od.SetExitTrigger(key, nil)
+		}
+		return
+	}
 	var entOds = make([]*ormo.InOutOrder, 0, len(odList))
 	var position float64
-	setAll := args == nil || args.Rate <= 0 || args.Rate >= 1
+	setAll := args.Rate <= 0 || args.Rate >= 1
 	for _, od := range odList {
 		if od.Status >= ormo.InOutStatusPartEnter && od.Status <= ormo.InOutStatusPartExit {
 			if setAll {
@@ -525,9 +532,9 @@ func (s *StratJob) setAllExitTrigger(dirt float64, key string, args *ormo.ExitTr
 }
 
 func (s *StratJob) SetAllStopLoss(dirt float64, args *ormo.ExitTrigger) {
-	s.setAllExitTrigger(dirt, "StopLoss", args)
+	s.setAllExitTrigger(dirt, ormo.OdInfoStopLoss, args)
 }
 
 func (s *StratJob) SetAllTakeProfit(dirt float64, args *ormo.ExitTrigger) {
-	s.setAllExitTrigger(dirt, "TakeProfit", args)
+	s.setAllExitTrigger(dirt, ormo.OdInfoTakeProfit, args)
 }

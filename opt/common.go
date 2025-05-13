@@ -113,11 +113,12 @@ func (o *OptInfo) runGetBtResult(pol *config.RunPolicyConfig) {
 	o.BTResult = bt.BTResult
 }
 
-func (o *OptInfo) ToPol(name, dirt, tfStr, pairStr string) *config.RunPolicyConfig {
+func (o *OptInfo) ToPol(idx int, name, dirt, tfStr, pairStr string) *config.RunPolicyConfig {
 	if o.Dirt == "" {
 		o.Dirt = dirt
 	}
 	res := &config.RunPolicyConfig{
+		Index:  idx,
 		Name:   name,
 		Dirt:   o.Dirt,
 		Params: o.Params,

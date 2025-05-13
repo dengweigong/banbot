@@ -3,7 +3,7 @@
   import type { BotTicket } from '$lib/dash/types';
   import {postApi} from '$lib/netio'
   import { browser } from '$app/environment';
-  import { save } from '$lib/dash/store';
+  import {loadBotAccounts, save} from '$lib/dash/store';
 
   let submitting = $state(false);
   let errorMsg = $state('');
@@ -16,6 +16,7 @@
     url: '',
     user_name: '',
     password: '',
+    env: '',
     token: '',
     accounts: {},
   };
@@ -23,12 +24,12 @@
   let model: BotTicket = $state(empty);
 
   if (browser) {
-    urlPlaceholder = `${window.location.protocol}//12.34.56.78`;
+    urlPlaceholder = `${window.location.protocol}//12.34.56.78:8001`;
   }
 
   function validateUrl(value: string): string | null {
     if (!value) return m.this_is_required();
-    if (!/^(https?:\/\/)?\S+/.test(value)) return m.not_url();
+    if (!/^(https?:\/\/)\S+/.test(value)) return m.not_url();
     return null;
   }
 
@@ -58,6 +59,7 @@
       if (data.code === 200) {
         model.name = data.name;
         model.token = data.token;
+        model.env = data.env;
         model.accounts = data.accounts || {};
         const oldNum = $save.tickets.filter(bot => bot.url === model.url && bot.user_name === model.user_name).length;
         const info = $state.snapshot(model);
@@ -67,6 +69,7 @@
             return s;
           });
         }
+        await loadBotAccounts(info);
         newBot(info);
       } else if (data.code === 401) {
         errorMsg = m.bad_user_pwd();

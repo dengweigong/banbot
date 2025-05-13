@@ -185,7 +185,7 @@
   function onOrderSelect(order: InOutOrder) {
     clickOrder = order;
     drawOrder = order;
-    const exs = exsMap?.[order.sid];
+    const exs = exsMap?.[order.symbol];
     if (!exs) {
       alerts.error(`symbol ${order.symbol} not found in ${Object.keys(exsMap || {}).length} items`);
       return;

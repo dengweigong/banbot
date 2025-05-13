@@ -12,6 +12,7 @@ import (
 type CalcDDExitRate func(s *StratJob, od *ormo.InOutOrder, maxChg float64) float64
 type PickTimeFrameFunc func(symbol string, tfScores []*core.TfScore) string
 type FnOdChange func(acc string, od *ormo.InOutOrder, evt int)
+type FnOnPostApi func(client *core.ApiClient, msg map[string]interface{}, jobs map[string]map[string]*StratJob) error
 
 type Warms map[string]map[string]int
 
@@ -30,21 +31,23 @@ type TradeStrat struct {
 	StopEnterBars int
 	EachMaxLong   int      // max number of long open orders for one pair, -1 for disable
 	EachMaxShort  int      // max number of short open orders for one pair, -1 for disable
-	AllowTFs      []string // Allow running time period, use global configuration when not provided 允许运行的时间周期，不提供时使用全局配置
+	RunTimeFrames []string // Allow running time period, use global configuration when not provided 允许运行的时间周期，不提供时使用全局配置
 	Outputs       []string // The content of the text file output by the strategy, where each string is one line 策略输出的文本文件内容，每个字符串是一行
 	Policy        *config.RunPolicyConfig
 
 	OnPairInfos         func(s *StratJob) []*PairSub
+	OnSymbols           func(items []string) []string // return modified pairs
 	OnStartUp           func(s *StratJob)
 	OnBar               func(s *StratJob)
 	OnInfoBar           func(s *StratJob, e *ta.BarEnv, pair, tf string)    // Other dependent bar data 其他依赖的bar数据
 	OnTrades            func(s *StratJob, trades []*banexg.Trade)           // Transaction by transaction data 逐笔交易数据
 	OnBatchJobs         func(jobs []*StratJob)                              // All target jobs at the current time, used for bulk opening/closing of orders 当前时间所有标的job，用于批量开单/平仓
-	OnBatchInfos        func(jobs map[string]*StratJob)                     // All info marked jobs at the current time, used for batch processing 当前时间所有info标的job，用于批量处理
+	OnBatchInfos        func(tf string, jobs map[string]*JobEnv)            // All info marked jobs at the current time, used for batch processing 当前时间所有info标的job，用于批量处理
 	OnCheckExit         func(s *StratJob, od *ormo.InOutOrder) *ExitReq     // Custom order exit logic 自定义订单退出逻辑
 	OnOrderChange       func(s *StratJob, od *ormo.InOutOrder, chgType int) // Order update callback 订单更新回调
 	GetDrawDownExitRate CalcDDExitRate                                      // Calculate the ratio of tracking profit taking, drawdown, and exit 计算跟踪止盈回撤退出的比率
 	PickTimeFrame       PickTimeFrameFunc                                   // Choose a suitable trading cycle for the specified currency 为指定币选择适合的交易周期
+	OnPostApi           FnOnPostApi                                         // callback for post api PostAPI时的策略回调
 	OnShutDown          func(s *StratJob)                                   // Callback when the robot stops 机器人停止时回调
 }
 
@@ -56,14 +59,10 @@ const (
 	OdChgExitFill         // Order exit completed 订单退出完成
 )
 
-const (
-	BatchTypeInOut = iota
-	BatchTypeInfo
-)
-
-type BatchTask struct {
-	Job  *StratJob
-	Type int
+type JobEnv struct {
+	Job    *StratJob
+	Env    *ta.BarEnv
+	Symbol string
 }
 
 /*
@@ -72,7 +71,7 @@ Batch execution task pool for all targets in the current exchange market time cy
 当前交易所-市场-时间周期下，所有标的的批量执行任务池
 */
 type BatchMap struct {
-	Map     map[string]*BatchTask
+	Map     map[string]*JobEnv
 	TFMSecs int64
 	ExecMS  int64 // The timestamp for executing batch tasks is delayed by a few seconds upon receiving a new target; Delay exceeded and BatchMS did not receive, start execution 执行批量任务的时间戳，每收到新的标的，推迟几秒；超过DelayBatchMS未收到，开始执行
 }
@@ -137,6 +136,7 @@ type EnterReq struct {
 	TakeProfitRate  float64 // Take profit exit ratio, 0 indicates full exit, needs to be between (0,1) 止盈退出比率，0表示全部退出，需介于(0,1]之间
 	TakeProfitTag   string  // Reason for profit taking 止盈原因
 	StopBars        int     // If the entry limit order exceeds how many bars and is not executed, it will be cancelled 入场限价单超过多少个bar未成交则取消
+	ClientID        string  // used as suffix of ClientOrderID to exchange
 }
 
 /*

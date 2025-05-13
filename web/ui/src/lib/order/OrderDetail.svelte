@@ -103,7 +103,7 @@
     {#if order.info}
       <div class="border rounded-lg p-5">
         <h3 class="text-lg font-bold mb-4">{m.additional_info()}</h3>
-        <pre class="whitespace-pre-wrap bg-base-200 p-4 rounded-lg text-sm">{JSON.stringify(order.info, null, 2)}</pre>
+        <pre class="whitespace-pre-wrap break-all bg-base-200 p-4 rounded-lg text-sm">{JSON.stringify(order.info, null, 2)}</pre>
       </div>
     {/if}
   </div> 

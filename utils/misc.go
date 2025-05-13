@@ -121,6 +121,26 @@ func ReverseArr[T any](s []T) {
 	}
 }
 
+func GetAddsRemoves[T comparable](news, olds []T) ([]T, []T) {
+	oldMap := make(map[T]bool)
+	for _, v := range olds {
+		oldMap[v] = true
+	}
+	var adds []T
+	for _, v := range news {
+		if _, ok := oldMap[v]; ok {
+			delete(oldMap, v)
+		} else {
+			adds = append(adds, v)
+		}
+	}
+	removes := make([]T, 0, len(oldMap))
+	for v := range oldMap {
+		removes = append(removes, v)
+	}
+	return adds, removes
+}
+
 func ConvertArr[T1, T2 any](arr []T1, doMap func(T1) T2) []T2 {
 	var res = make([]T2, len(arr))
 	for i, item := range arr {

@@ -12,7 +12,6 @@ import (
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banbot/strat"
-	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
@@ -96,11 +95,12 @@ func (t *Trader) onAccountKline(account string, env *ta.BarEnv, bar *orm.InfoKli
 	openOds, lock := ormo.GetOpenODs(account)
 	// Update orders in non-production mode 更新非生产模式的订单
 	lock.Lock()
-	allOrders := utils.ValsOfMap(openOds)
+	allOrders := utils2.ValsOfMap(openOds)
 	lock.Unlock()
 	odMgr := GetOdMgr(account)
 	var err *errs.Error
-	if !bar.IsWarmUp && len(allOrders) > 0 {
+	isWarmup := bar.IsWarmUp
+	if !isWarmup && len(allOrders) > 0 {
 		// The order status may be modified here
 		// 这里可能修改订单状态
 		err = odMgr.UpdateByBar(allOrders, bar)
@@ -116,62 +116,11 @@ func (t *Trader) onAccountKline(account string, env *ta.BarEnv, bar *orm.InfoKli
 			curOrders = append(curOrders, od)
 		}
 	}
-	var enters []*strat.EnterReq
-	var exits []*strat.ExitReq
-	var edits []*ormo.InOutEdit
-	for _, job := range jobs {
-		job.IsWarmUp = bar.IsWarmUp
-		job.InitBar(curOrders)
-		snap := job.SnapOrderStates()
-		job.Strat.OnBar(job)
-		var isBatch = false
-		if !barExpired {
-			isBatch = job.Strat.BatchInOut && job.Strat.OnBatchJobs != nil
-			if isBatch {
-				AddBatchJob(account, bar.TimeFrame, job, false)
-			} else {
-				enters = append(enters, job.Entrys...)
-			}
-		}
-		if !bar.IsWarmUp {
-			curEdits, err := job.CheckCustomExits(snap)
-			if err != nil {
-				return err
-			}
-			edits = append(edits, curEdits...)
-		}
-		if !isBatch {
-			exits = append(exits, job.Exits...)
-		}
-	}
-	// invoke OnInfoBar
-	// 更新辅助订阅数据
-	// 此处不应允许开平仓或更新止盈止损等，否则订单的TimeFrame会出现歧义
-	for _, job := range infoJobs {
-		job.IsWarmUp = bar.IsWarmUp
-		job.Strat.OnInfoBar(job, env, bar.Symbol, bar.TimeFrame)
-		if job.Strat.BatchInfo && job.Strat.OnBatchInfos != nil {
-			AddBatchJob(account, bar.TimeFrame, job, true)
-		}
-	}
-	// 处理订单
-	if bar.IsWarmUp {
-		return nil
-	}
-	return t.ExecOrders(odMgr, jobs, env, enters, exits, edits)
-}
-
-func (t *Trader) ExecOrders(odMgr IOrderMgr, jobs map[string]*strat.StratJob, env *ta.BarEnv,
-	enters []*strat.EnterReq, exits []*strat.ExitReq, edits []*ormo.InOutEdit) *errs.Error {
-	if len(enters)+len(exits)+len(edits) == 0 {
-		return nil
-	}
 	var sess *ormo.Queries
-	var conn *sql.DB
-	var err *errs.Error
-	if core.LiveMode {
+	if core.LiveMode && !isWarmup {
 		// Live mode is saved to the database. Non-real-time mode, orders are temporarily saved in memory, no database required
 		// 实时模式保存到数据库。非实时模式，订单临时保存到内存，无需数据库
+		var conn *sql.DB
 		sess, conn, err = ormo.Conn(orm.DbTrades, true)
 		if err != nil {
 			log.Error("get db sess fail", zap.Error(err))
@@ -179,32 +128,45 @@ func (t *Trader) ExecOrders(odMgr IOrderMgr, jobs map[string]*strat.StratJob, en
 		}
 		defer conn.Close()
 	}
-	var ents, exts []*ormo.InOutOrder
-	ents, exts, err = odMgr.ProcessOrders(sess, env, enters, exits, edits)
-	if err != nil {
-		log.Error("process orders fail", zap.Error(err))
-		return err
-	}
-	var jobMap = map[string]*strat.StratJob{}
 	for _, job := range jobs {
-		if job.Strat.OnOrderChange == nil {
-			continue
+		job.IsWarmUp = isWarmup
+		job.InitBar(curOrders)
+		job.Strat.OnBar(job)
+		isBatch := job.Strat.BatchInOut && job.Strat.OnBatchJobs != nil
+		if !barExpired {
+			if isBatch {
+				AddBatchJob(account, bar.TimeFrame, job, nil)
+			}
+		} else {
+			entryNum := len(job.Entrys)
+			if core.LiveMode && !isWarmup && entryNum > 0 {
+				log.Info("skip open orders by bar expired", zap.String("acc", account),
+					zap.String("pair", bar.Symbol), zap.String("tf", bar.TimeFrame),
+					zap.Int("num", entryNum))
+				strat.AddAccFailOpens(account, strat.FailOpenBarTooLate, entryNum)
+				job.Entrys = nil
+			}
 		}
-		jobMap[job.Strat.Name] = job
+		if !isWarmup {
+			err = strat.CheckCustomExits(job)
+			if err != nil {
+				return err
+			}
+			_, _, err = odMgr.ProcessOrders(sess, job)
+			if err != nil {
+				return err
+			}
+		}
 	}
-	for _, od := range ents {
-		job, ok := jobMap[od.Strategy]
-		if !ok || job.Strat.OnOrderChange == nil {
-			continue
+	// invoke OnInfoBar
+	// 更新辅助订阅数据
+	// 此处不应允许开平仓或更新止盈止损等，否则订单的TimeFrame会出现歧义
+	for _, job := range infoJobs {
+		job.IsWarmUp = isWarmup
+		job.Strat.OnInfoBar(job, env, bar.Symbol, bar.TimeFrame)
+		if job.Strat.BatchInfo && job.Strat.OnBatchInfos != nil {
+			AddBatchJob(account, bar.TimeFrame, job, env)
 		}
-		job.Strat.OnOrderChange(job, od, strat.OdChgEnter)
-	}
-	for _, od := range exts {
-		job, ok := jobMap[od.Strategy]
-		if !ok || job.Strat.OnOrderChange == nil {
-			continue
-		}
-		job.Strat.OnOrderChange(job, od, strat.OdChgExit)
 	}
 	return nil
 }

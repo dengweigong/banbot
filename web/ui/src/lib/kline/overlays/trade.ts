@@ -1,4 +1,4 @@
-import type {OverlayEvent, OverlayTemplate} from 'klinecharts';
+import type {OverlayTemplate} from 'klinecharts';
 import type {TradeInfo} from "../types";
 
 const textStyles = {
@@ -70,22 +70,22 @@ const trade: OverlayTemplate = {
     }
     return [line_fig, in_fig, out_fig, vert_start, vert_stop]
   },
-  onSelected: (e: OverlayEvent) => {
+  onSelected: (e: any) => {
     const data = e.overlay.extendData as TradeInfo;
     data.selected = true
     return false
   },
-  onDeselected: (e: OverlayEvent) => {
+  onDeselected: (e: any) => {
     const data = e.overlay.extendData as TradeInfo;
     data.selected = false
     return false
   },
-  onMouseEnter: (e: OverlayEvent) => {
+  onMouseEnter: (e: any) => {
     const data = e.overlay.extendData as TradeInfo;
     data.active = true
     return false
   },
-  onMouseLeave: (e: OverlayEvent) => {
+  onMouseLeave: (e: any) => {
     const data = e.overlay.extendData as TradeInfo;
     data.active = false
     return false

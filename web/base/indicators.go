@@ -141,7 +141,7 @@ var (
 			doCalc: func(e *ta.BarEnv, params []float64) []float64 {
 				res := make([]float64, len(params))
 				for i, p := range params {
-					dev, _ := ta.StdDev(e.Close, int(p))
+					dev := ta.StdDev(e.Close, int(p))
 					res[i] = dev.Get(0)
 				}
 				return res

@@ -18,7 +18,6 @@ import (
 	"go.uber.org/zap"
 	"math"
 	"os"
-	"slices"
 	"time"
 )
 
@@ -70,11 +69,13 @@ func (b *BackTestLite) FeedKLine(bar *orm.InfoKline) bool {
 		if curTime > strat.LastBatchMS {
 			// Enter the next timeframe and trigger the batch entry callback
 			// 进入下一个时间帧，触发批量入场回调
+			btime.CurTimeMS = strat.LastBatchMS
 			waitNum := biz.TryFireBatches(curTime)
 			if waitNum > 0 {
-				panic(fmt.Sprintf("batch job exec fail, wait: %v", waitNum))
+				log.Warn(fmt.Sprintf("batch job exec fail, wait: %v", waitNum))
 			}
 			strat.LastBatchMS = curTime
+			btime.CurTimeMS = curTime
 		}
 		if curTime > b.lastTime {
 			b.lastTime = curTime
@@ -191,13 +192,17 @@ func (b *BackTest) FeedKLine(bar *orm.InfoKline) {
 	ok := b.BackTestLite.FeedKLine(bar)
 	if !bar.IsWarmUp && core.CheckWallets {
 		core.CheckWallets = false
-		b.logState(bar.Time, curTime)
+		odNum := ormo.OpenNum(config.DefAcc, ormo.InOutStatusPartEnter)
+		b.logState(bar.Time, curTime, odNum)
 	}
 	if ok && b.nextRefresh > 0 && bar.Time >= b.nextRefresh {
 		// 刷新交易对
+		refreshMs := b.nextRefresh
 		b.nextRefresh = b.schedule.Next(time.UnixMilli(bar.Time)).UnixMilli()
+		btime.CurTimeMS = refreshMs
 		err := RefreshPairJobs(b.dp, !b.isOpt, false, nil)
-		dateStr := btime.ToDateStr(curTime, "")
+		btime.CurTimeMS = curTime
+		dateStr := btime.ToDateStr(refreshMs, "")
 		if err != nil {
 			log.Error("RefreshPairJobs", zap.String("date", dateStr), zap.Error(err))
 		} else {
@@ -253,9 +258,10 @@ func (b *BackTest) Run() {
 
 func (b *BackTest) initTaskOut() *errs.Error {
 	if b.OutDir != "" {
-		config.Args.Logfile = b.OutDir + "/out.log"
-		if utils.Exists(config.Args.Logfile) {
-			err_ := os.Remove(config.Args.Logfile)
+		logFile := b.OutDir + "/out.log"
+		config.Args.Logfile = logFile
+		if utils.Exists(logFile) {
+			err_ := os.Remove(logFile)
 			if err_ != nil {
 				log.Warn("delete old log fail", zap.Error(err_))
 			}
@@ -270,100 +276,6 @@ func (b *BackTest) initTaskOut() *errs.Error {
 		log.Warn("stake_amt may result in inconsistent order amounts with each backtest!")
 	}
 	return nil
-}
-
-func (b *BackTest) logState(startMS, timeMS int64) {
-	if b.StartMS == 0 {
-		b.StartMS = startMS
-	}
-	b.EndMS = timeMS
-	wallets := biz.GetWallets(config.DefAcc)
-	totalLegal := wallets.TotalLegal(nil, true)
-	b.MinReal = min(b.MinReal, totalLegal)
-	if totalLegal >= b.MaxReal {
-		b.MaxReal = totalLegal
-	} else {
-		drawDownPct := (b.MaxReal - totalLegal) * 100 / b.MaxReal
-		b.MaxDrawDownPct = max(b.MaxDrawDownPct, drawDownPct)
-		b.MaxDrawDownVal = max(b.MaxDrawDownVal, b.MaxReal-totalLegal)
-		maxOccupy := b.MaxReal - wallets.AvaLegal(nil)
-		b.MaxFundOccup = max(b.MaxFundOccup, maxOccupy)
-		b.MaxOccupForPair = max(b.MaxOccupForPair, maxOccupy/float64(len(core.Pairs)))
-	}
-	odNum := ormo.OpenNum(config.DefAcc, ormo.InOutStatusPartEnter)
-	if b.TimeNum%b.PlotEvery != 0 {
-		if odNum > b.Plots.tmpOdNum {
-			b.Plots.tmpOdNum = odNum
-		}
-		return
-	}
-	if b.Plots.tmpOdNum > odNum {
-		odNum = b.Plots.tmpOdNum
-	}
-	b.Plots.tmpOdNum = 0
-	splStep := 5
-	if len(b.Plots.Real) >= ShowNum*splStep {
-		// Check whether there is too much data and resample if the total number of samples exceeds 5 times
-		// 检查数据是否太多，超过采样总数5倍时，进行重采样
-		b.PlotEvery *= splStep
-		oldNum := len(b.Plots.Real)
-		newNum := oldNum / splStep
-		plots := &PlotData{
-			Labels:        make([]string, 0, newNum),
-			OdNum:         make([]int, 0, newNum),
-			JobNum:        make([]int, 0, newNum),
-			Real:          make([]float64, 0, newNum),
-			Available:     make([]float64, 0, newNum),
-			UnrealizedPOL: make([]float64, 0, newNum),
-			WithDraw:      make([]float64, 0, newNum),
-		}
-		for i := 0; i < oldNum; i += splStep {
-			plots.Labels = append(plots.Labels, b.Plots.Labels[i])
-			plots.OdNum = append(plots.OdNum, slices.Max(b.Plots.OdNum[i:i+splStep]))
-			plots.JobNum = append(plots.JobNum, slices.Max(b.Plots.JobNum[i:i+splStep]))
-			plots.Real = append(plots.Real, b.Plots.Real[i])
-			plots.Available = append(plots.Available, b.Plots.Available[i])
-			plots.Profit = append(plots.Profit, b.Plots.Profit[i])
-			plots.UnrealizedPOL = append(plots.UnrealizedPOL, b.Plots.UnrealizedPOL[i])
-			plots.WithDraw = append(plots.WithDraw, b.Plots.WithDraw[i])
-		}
-		b.Plots = plots
-		return
-	}
-	// 这里应使用bar的开始时间，避免多个时间周期运行时，大部分CheckMS未更新
-	b.logPlot(wallets, startMS, odNum, totalLegal)
-}
-
-func (b *BackTest) logPlot(wallets *biz.BanWallets, timeMS int64, odNum int, totalLegal float64) {
-	if odNum < 0 {
-		odNum = ormo.OpenNum(config.DefAcc, ormo.InOutStatusPartEnter)
-	}
-	jobNum := 0
-	jobMap := strat.GetJobs(wallets.Account)
-	for _, jobs := range jobMap {
-		for _, j := range jobs {
-			if j.CheckMS+j.Env.TFMSecs >= timeMS {
-				jobNum += 1
-			}
-		}
-	}
-	if totalLegal < 0 {
-		totalLegal = wallets.TotalLegal(nil, true)
-	}
-	avaLegal := wallets.AvaLegal(nil)
-	profitLegal := wallets.UnrealizedPOLLegal(nil)
-	drawLegal := wallets.GetWithdrawLegal(nil)
-	curDate := btime.ToDateStr(timeMS, "")
-	b.donePftLegal += ormo.LegalDoneProfits(b.histOdOff)
-	b.histOdOff = len(ormo.HistODs)
-	b.Plots.Labels = append(b.Plots.Labels, curDate)
-	b.Plots.OdNum = append(b.Plots.OdNum, odNum)
-	b.Plots.JobNum = append(b.Plots.JobNum, jobNum)
-	b.Plots.Real = append(b.Plots.Real, totalLegal)
-	b.Plots.Available = append(b.Plots.Available, avaLegal)
-	b.Plots.Profit = append(b.Plots.Profit, b.donePftLegal)
-	b.Plots.UnrealizedPOL = append(b.Plots.UnrealizedPOL, profitLegal)
-	b.Plots.WithDraw = append(b.Plots.WithDraw, drawLegal)
 }
 
 func (b *BackTest) cronDumpBtStatus() {
@@ -404,7 +316,20 @@ func (b *BackTest) initRefreshCron() *errs.Error {
 }
 
 func RefreshPairJobs(dp data.IProvider, showLog, isFirst bool, pBar *utils.StagedPrg) *errs.Error {
-	pairs, pairTfScores, err := biz.RefreshPairs(showLog, isFirst, pBar)
+	curTime := btime.TimeMS()
+	if isFirst {
+		if config.PairMgr.Cron != "" {
+			schedule, err_ := utils.NewCronScheduler(config.PairMgr.Cron)
+			if err_ != nil {
+				return errs.New(errs.CodeRunTime, err_)
+			}
+			curTime = utils.CronPrev(schedule, btime.ToTime(curTime)).UnixMilli()
+		} else if !core.EnvReal && config.PairMgr.UseLatest {
+			// 回测时配置use_latest=true，且cron为空，则使用最新时间刷新交易品种
+			curTime = min(btime.UTCStamp(), config.TimeRange.EndMS)
+		}
+	}
+	pairs, pairTfScores, err := biz.RefreshPairs(showLog, curTime, pBar)
 	if err != nil {
 		return err
 	}
@@ -478,7 +403,7 @@ func relayUnFinishOrders(pairTfScores map[string]map[string]float64, forbidJobs 
 		lite := NewBackTestLite(true, nil, nil, nil)
 		// set policy to run
 		// 重新加载策略任务
-		config.RunPolicy = gp.Policies
+		config.SetRunPolicy(false, gp.Policies...)
 		warms, _, err := strat.LoadStratJobs(core.Pairs, pairTfScores)
 		if err != nil {
 			return err

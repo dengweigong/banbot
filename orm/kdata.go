@@ -44,6 +44,8 @@ func FetchApiOHLCV(ctx context.Context, exchange banexg.BanExchange, pair, timeF
 		startMS, endMS = endMS, startMS
 		dirt = -1
 	}
+	// 交易所返回的最后一个可能是未完成bar，需要过滤掉
+	endMS = utils2.AlignTfMSecs(min(endMS, btime.UTCStamp()), tfMSecs)
 	fetchNum := int((endMS - startMS) / tfMSecs)
 	if fetchNum == 0 {
 		return nil
@@ -269,6 +271,22 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 	}()
 
 	wg.Wait()
+	// 检查是否需要下载未完成bar
+	curMS := btime.UTCStamp()
+	tfMSecs := int64(tfSecs * 1000)
+	curAlignMS := utils2.AlignTfMSecs(curMS, tfMSecs)
+	if endMS > curAlignMS {
+		data, err := exchange.FetchOHLCV(exs.Symbol, timeFrame, curAlignMS, 1, nil)
+		if err != nil {
+			log.Warn("fetch unfinish bar fail", zap.Error(err))
+		}
+		if len(data) > 0 {
+			err = sess.SetUnfinish(exs.ID, timeFrame, curMS, data[0])
+			if err != nil {
+				log.Warn("set unfinish fail", zap.Int32("sid", exs.ID), zap.String("tf", timeFrame), zap.Error(err))
+			}
+		}
+	}
 	err_ := sess.DelInsKline(context.Background(), insId)
 	if err_ != nil {
 		log.Warn("DelInsKline fail", zap.Int32("id", insId), zap.Error(err_))
@@ -285,7 +303,7 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 				zap.String("tf", timeFrame), zap.Error(err))
 		}
 	} else if saveNum > 0 {
-		err = sess.UpdateKRange(exs.ID, timeFrame, realStart, realEnd, nil, true)
+		err = sess.UpdateKRange(exs, timeFrame, realStart, realEnd, nil, true)
 	}
 	if err != nil {
 		if outErr == nil {
@@ -382,7 +400,7 @@ func (q *Queries) GetOHLCV(exs *ExSymbol, timeFrame string, startMS, endMS int64
 			}
 		}
 	}
-	klines, err := q.QueryOHLCV(exs.ID, timeFrame, startMS, endMS, limit, withUnFinish)
+	klines, err := q.QueryOHLCV(exs, timeFrame, startMS, endMS, limit, withUnFinish)
 	return nil, klines, err
 }
 
@@ -452,7 +470,7 @@ func (q *Queries) GetAdjOHLCV(adjs []*AdjInfo, timeFrame string, startMS, endMS 
 			// 逆序读取，从后往前，开始置为0
 			start = 0
 		}
-		klines, err := q.QueryOHLCV(f.ID, timeFrame, start, stop, limit, withUnFinish)
+		klines, err := q.QueryOHLCV(f.ExSymbol, timeFrame, start, stop, limit, withUnFinish)
 		if err != nil {
 			return nil, err
 		}
@@ -679,15 +697,15 @@ func FastBulkOHLCV(exchange banexg.BanExchange, symbols []string, timeFrame stri
 	itemNum := (sugEndMS - sugStartMS) / tfMSecs
 	leftArr := make([]int32, 0, len(exsMap))
 	if itemNum < int64(core.KBatchSize) {
-		sidArr := make([]int32, 0, len(exsMap))
+		rawMap := make(map[int32]*ExSymbol)
 		for sid, exs := range exsMap {
 			if exs.Combined {
 				leftArr = append(leftArr, sid)
 			} else {
-				sidArr = append(sidArr, sid)
+				rawMap[sid] = exs
 			}
 		}
-		if len(sidArr) > 0 {
+		if len(rawMap) > 0 {
 			bulkHandler := func(sid int32, klines []*banexg.Kline) {
 				exs, ok := exsMap[sid]
 				if !ok {
@@ -695,7 +713,7 @@ func FastBulkOHLCV(exchange banexg.BanExchange, symbols []string, timeFrame stri
 				}
 				handler(exs.Symbol, timeFrame, klines, nil)
 			}
-			err = sess.QueryOHLCVBatch(sidArr, timeFrame, startMS, endMS, limit, bulkHandler)
+			err = sess.QueryOHLCVBatch(rawMap, timeFrame, startMS, endMS, limit, bulkHandler)
 			if err != nil {
 				return err
 			}

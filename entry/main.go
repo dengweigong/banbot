@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"github.com/banbox/banbot/utils"
+	"github.com/sasha-s/go-deadlock"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -48,6 +49,9 @@ func RunCmd() {
 		core.RunExitCalls()
 		os.Exit(0)
 	}()
+
+	// disable deadlock by default
+	deadlock.Opts.Disable = true
 
 	args := os.Args[1:]
 	if len(args) == 0 {

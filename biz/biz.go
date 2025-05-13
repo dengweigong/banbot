@@ -89,16 +89,24 @@ func SetupComsExg(args *config.CmdArgs) *errs.Error {
 	return orm.InitExg(exg.Default)
 }
 
-func RefreshPairs(showLog, cronStart bool, pBar *utils.StagedPrg) ([]string, map[string]map[string]float64, *errs.Error) {
+func RefreshPairs(showLog bool, timeMS int64, pBar *utils.StagedPrg) ([]string, map[string]map[string]float64, *errs.Error) {
 	goods.ShowLog = showLog
-	pairs, err := goods.RefreshPairList(cronStart)
+	pairs, err := goods.RefreshPairList(timeMS)
 	if err != nil {
 		return nil, nil, err
 	}
 	if pBar != nil {
 		pBar.SetProgress("loadPairs", 1)
 	}
-	pairTfScores, err := strat.CalcPairTfScores(exg.Default, pairs)
+	allPairs := make([]string, 0, len(pairs))
+	allPairs = append(allPairs, pairs...)
+	for _, r := range config.RunPolicy {
+		if len(r.Pairs) > 0 {
+			allPairs = append(allPairs, r.Pairs...)
+		}
+	}
+	allPairs, _ = utils.UniqueItems(allPairs)
+	pairTfScores, err := strat.CalcPairTfScores(exg.Default, allPairs)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -133,7 +141,7 @@ func RefreshJobs(pairs []string, pairTfScores map[string]map[string]float64, sho
 		}
 	}
 	if showLog {
-		core.PrintStratGroups()
+		strat.PrintStratGroups()
 	}
 	if pBar != nil {
 		pBar.SetProgress("loadJobs", 1)
@@ -178,6 +186,12 @@ func InitOdSubs() {
 			job, _ := its[od.Strategy]
 			if job != nil {
 				stgy.OnOrderChange(job, od, evt)
+				if len(job.Entrys) > 0 || len(job.Exits) > 0 {
+					_, _, err := GetOdMgr(acc).ProcessOrders(nil, job)
+					if err != nil {
+						log.Error("process orders fail", zap.Error(err))
+					}
+				}
 			}
 		})
 	}
@@ -193,14 +207,14 @@ Even if the job has no entry tasks, this method should be called to postpone the
 添加批量入场任务。
 即使job没有入场任务，也应该调用此方法，用于推迟入场时间TFEnterMS
 */
-func AddBatchJob(account, tf string, job *strat.StratJob, isInfo bool) {
+func AddBatchJob(account, tf string, job *strat.StratJob, infoEnv *ta.BarEnv) {
 	lockBatch.Lock()
 	defer lockBatch.Unlock()
 	key := fmt.Sprintf("%s_%s_%s", tf, account, job.Strat.Name)
 	tasks, ok := strat.BatchTasks[key]
 	if !ok {
 		tasks = &strat.BatchMap{
-			Map:     make(map[string]*strat.BatchTask),
+			Map:     make(map[string]*strat.JobEnv),
 			TFMSecs: int64(utils2.TFToSecs(tf) * 1000),
 		}
 		strat.BatchTasks[key] = tasks
@@ -208,11 +222,13 @@ func AddBatchJob(account, tf string, job *strat.StratJob, isInfo bool) {
 	// Delay 3s to wait for execution
 	// 推迟3s等待执行
 	tasks.ExecMS = btime.TimeMS() + core.DelayBatchMS
-	var batchType = strat.BatchTypeInOut
-	if isInfo {
-		batchType = strat.BatchTypeInfo
+	var pair = job.Symbol.Symbol
+	var pairKey = pair + "_main"
+	if infoEnv != nil {
+		pair = infoEnv.Symbol
+		pairKey = pair + "_info"
 	}
-	tasks.Map[job.Symbol.Symbol] = &strat.BatchTask{Job: job, Type: batchType}
+	tasks.Map[pairKey] = &strat.JobEnv{Job: job, Env: infoEnv, Symbol: pair}
 }
 
 func TryFireBatches(currMS int64) int {
@@ -241,50 +257,43 @@ func TryFireBatches(currMS int64) int {
 			}
 			continue
 		}
-		var enterJobs []*strat.StratJob
-		var infoJobs = make(map[string]*strat.StratJob)
+		var mainJobs []*strat.StratJob
+		var infoJobs = make(map[string]*strat.JobEnv)
 		var stgy *strat.TradeStrat
-		for pair, task := range tasks.Map {
+		for _, task := range tasks.Map {
 			stgy = task.Job.Strat
-			if task.Type == strat.BatchTypeInOut {
-				enterJobs = append(enterJobs, task.Job)
-			} else if task.Type == strat.BatchTypeInfo {
-				infoJobs[pair] = task.Job
+			if task.Env == nil {
+				mainJobs = append(mainJobs, task.Job)
 			} else {
-				panic(fmt.Sprintf("unsupport BatchType: %v", task.Type))
+				infoJobs[task.Symbol] = task
 			}
 		}
+		arr := strings.Split(key, "_")
+		timeframe, account := arr[0], arr[1]
+		openOds, lock := ormo.GetOpenODs(account)
+		lock.Lock()
+		allOrders := utils.ValsOfMap(openOds)
+		lock.Unlock()
 		delete(strat.BatchTasks, key)
-		if len(enterJobs) > 0 {
+		for _, job := range mainJobs {
+			job.InitBar(allOrders)
+		}
+		if len(infoJobs) > 0 {
+			stgy.OnBatchInfos(timeframe, infoJobs)
+		}
+		if len(mainJobs) > 0 {
 			// Check all batch tasks at this time and decide which ones to enter or exit
 			// 检查此时间所有批量任务，决定哪些入场或那些出场
-			stgy.OnBatchJobs(enterJobs)
+			stgy.OnBatchJobs(mainJobs)
 			// Perform entry/exit tasks
 			// 执行入场/出场任务
-			keyParts := strings.Split(key, "_")
-			odMgr := GetOdMgr(keyParts[1])
-			var ents []*ormo.InOutOrder
-			var exits []*ormo.InOutOrder
-			for _, job := range enterJobs {
-				if len(job.Entrys) == 0 && len(job.Exits) == 0 {
-					continue
-				}
-				ents, exits, err = odMgr.ProcessOrders(sess, job.Env, job.Entrys, job.Exits, nil)
-				if job.Strat.OnOrderChange != nil {
-					for _, od := range ents {
-						job.Strat.OnOrderChange(job, od, strat.OdChgEnter)
-					}
-					for _, od := range exits {
-						job.Strat.OnOrderChange(job, od, strat.OdChgExit)
-					}
-				}
+			odMgr := GetOdMgr(account)
+			for _, job := range mainJobs {
+				_, _, err = odMgr.ProcessOrders(sess, job)
 				if err != nil {
 					log.Error("process orders fail", zap.Error(err))
 				}
 			}
-		}
-		if len(infoJobs) > 0 {
-			stgy.OnBatchInfos(infoJobs)
 		}
 	}
 	return waitNum
@@ -410,22 +419,18 @@ func InitDataDir() *errs.Error {
 	if err_ != nil {
 		return errs.New(errs.CodeIOWriteFail, err_)
 	}
-	var err *errs.Error
 	configPath := filepath.Join(dataDir, "config.yml")
 	configLocalPath := filepath.Join(dataDir, "config.local.yml")
-	exists := utils.Exists(configPath)
-	existLocal := utils.Exists(configLocalPath)
-	if exists || existLocal {
+	if utils.Exists(configPath) || utils.Exists(configLocalPath) {
 		// dont init config in dataDir if any of config.yml/config.local.yml exist
 		return nil
 	}
-	if !exists {
-		err = utils.WriteFile(configPath, replaceDockerHosts(configData))
-		log.Info("init done: $config.yml")
+	err := utils.WriteFile(configPath, replaceDockerHosts(configData))
+	if err != nil {
+		return err
 	}
-	if !existLocal {
-		err = utils.WriteFile(configLocalPath, replaceDockerHosts(configLocalData))
-		log.Info("init done: $config.local.yml")
-	}
+	log.Info("init done", zap.String("p", configPath))
+	err = utils.WriteFile(configLocalPath, replaceDockerHosts(configLocalData))
+	log.Info("init done", zap.String("p", configLocalPath))
 	return err
 }

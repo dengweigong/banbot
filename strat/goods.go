@@ -240,7 +240,7 @@ func allAllowTFs() []string {
 			// 配置的时间周期优先级高于策略写死的
 			groups = append(groups, pol.RunTimeframes)
 		} else {
-			groups = append(groups, stagy.AllowTFs)
+			groups = append(groups, stagy.RunTimeFrames)
 		}
 	}
 	return utils.UnionArr(groups...)

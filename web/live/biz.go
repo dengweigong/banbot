@@ -116,15 +116,17 @@ func walletItems(wallet *biz.BanWallets) []map[string]interface{} {
 func postRefreshWallet(c *fiber.Ctx) error {
 	return wrapAccount(c, func(account string) error {
 		wallet := biz.GetWallets(account)
-		rsp, err := exg.Default.FetchBalance(map[string]interface{}{
-			banexg.ParamAccount: account,
-		})
-		if err != nil {
-			return err
+		if core.EnvReal {
+			rsp, err := exg.Default.FetchBalance(map[string]interface{}{
+				banexg.ParamAccount: account,
+			})
+			if err != nil {
+				return err
+			}
+			biz.UpdateWalletByBalances(wallet, rsp)
+			rsp.Info = nil
+			log.Info("RefreshWallet", zap.String("acc", account), zap.Any("rsp", rsp))
 		}
-		biz.UpdateWalletByBalances(wallet, rsp)
-		rsp.Info = nil
-		log.Info("RefreshWallet", zap.String("acc", account), zap.Any("rsp", rsp))
 		return c.JSON(fiber.Map{
 			"items": walletItems(wallet),
 			"total": wallet.FiatValue(true),
@@ -703,7 +705,7 @@ func getTaskPairs(c *fiber.Ctx) error {
 }
 
 func getExsMap(c *fiber.Ctx) error {
-	exsMap := orm.GetExSymbols(core.ExgName, core.Market)
+	exsMap := orm.GetExSymbolMap(core.ExgName, core.Market)
 	return c.JSON(fiber.Map{
 		"data": exsMap,
 	})
@@ -990,10 +992,10 @@ func getLog(c *fiber.Ctx) error {
 	if err_ := base.VerifyArg(c, args, base.ArgQuery); err_ != nil {
 		return err_
 	}
-	if config.Args.Logfile == "" {
+	if core.LogFile == "" {
 		return c.JSON(fiber.Map{"code": 400, "msg": "no log file"})
 	}
-	data, pos, err := utils.ReadFileTail(config.Args.Logfile, args.Limit, args.End)
+	data, pos, err := utils.ReadFileTail(core.LogFile, args.Limit, args.End)
 	if err != nil {
 		return err
 	}
@@ -1018,6 +1020,7 @@ func getBotInfo(c *fiber.Ctx) error {
 			"cpuPct":       percent[0],
 			"ramPct":       v.UsedPercent,
 			"lastProcess":  core.LastCopiedMs,
+			"env":          core.RunEnv,
 			"allowTradeAt": stopUntil,
 		})
 	})

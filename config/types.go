@@ -60,6 +60,8 @@ var (
 	APIServer        *APIServerConfig
 	RPCChannels      map[string]map[string]interface{}
 	Webhook          map[string]map[string]string
+
+	outSaved = false // Docker外部传入配置是否已保存到config.local.yml
 )
 
 const (
@@ -86,8 +88,8 @@ type Config struct {
 	MarketType       string                            `yaml:"market_type,omitempty" mapstructure:"market_type"`
 	ContractType     string                            `yaml:"contract_type,omitempty" mapstructure:"contract_type"`
 	OdBookTtl        int64                             `yaml:"odbook_ttl,omitempty" mapstructure:"odbook_ttl"`
-	StopEnterBars    int                               `json:"stop_enter_bars,omitempty" mapstructure:"stop_enter_bars"`
-	ConcurNum        int                               `json:"concur_num,omitempty" mapstructure:"concur_num"`
+	StopEnterBars    int                               `yaml:"stop_enter_bars,omitempty" mapstructure:"stop_enter_bars"`
+	ConcurNum        int                               `yaml:"concur_num,omitempty" mapstructure:"concur_num"`
 	OrderType        string                            `yaml:"order_type,omitempty" mapstructure:"order_type"`
 	PreFire          float64                           `yaml:"prefire,omitempty" mapstructure:"prefire"`
 	MarginAddRate    float64                           `yaml:"margin_add_rate,omitempty" mapstructure:"margin_add_rate"`
@@ -150,6 +152,7 @@ type RunPolicyConfig struct {
 	PairParams    map[string]map[string]float64 `yaml:"pair_params,omitempty" mapstructure:"pair_params"`
 	defs          map[string]*core.Param
 	Score         float64
+	Index         int // index in run_policy array
 }
 
 type StratPerfConfig struct {
@@ -181,6 +184,7 @@ type APIServerConfig struct {
 type UserConfig struct {
 	Username    string            `yaml:"user,omitempty" mapstructure:"user"`           // 用户名
 	Password    string            `yaml:"pwd,omitempty" mapstructure:"pwd"`             // 密码
+	AllowIPs    []string          `yaml:"allow_ips" mapstructure:"allow_ips"`           // Allow access from specific IP addresses 允许从特定IP地址访问
 	AccRoles    map[string]string `yaml:"acc_roles,omitempty" mapstructure:"acc_roles"` // Role permissions for different accounts 对不同账户的角色权限
 	ExpireHours float64           `yaml:"exp_hours" mapstructure:"exp_hours"`           // Token expiration time, default 168 hours token过期时间，默认168小时
 }
@@ -217,6 +221,7 @@ type PairMgrConfig struct {
 	ForceFilters bool `yaml:"force_filters" mapstructure:"force_filters,omitempty"`
 	// hold/close 品种切换时保留还是退出仓位
 	PosOnRotation string `yaml:"pos_on_rotation" mapstructure:"pos_on_rotation"`
+	UseLatest     bool   `yaml:"use_latest" mapstructure:"use_latest"`
 }
 
 // UNIVERSAL FILTER 通用的过滤器

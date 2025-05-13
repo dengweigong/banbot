@@ -54,4 +54,5 @@ type CmdArgs struct {
 	BatchSize     int
 	Separate      bool // Used for backtesting. When true, the strategy combination is tested separately. 用于回测，true时策略组合单独测试
 	Inited        bool
+	DeadLock      bool
 }

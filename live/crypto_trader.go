@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"github.com/banbox/banbot/opt"
 	"github.com/banbox/banbot/orm/ormo"
+	"strings"
 	"time"
 
 	"github.com/banbox/banbot/biz"
@@ -70,6 +71,7 @@ func (t *CryptoTrader) Init() *errs.Error {
 
 func (t *CryptoTrader) initOdMgr() *errs.Error {
 	if !core.EnvReal {
+		biz.InitFakeWallets()
 		biz.InitLocalOrderMgr(t.orderCB, true)
 		return nil
 	}
@@ -108,12 +110,14 @@ func (t *CryptoTrader) Run() *errs.Error {
 }
 
 func (t *CryptoTrader) FeedKLine(bar *orm.InfoKline) {
+	delayExecBatch()
+	envKey := strings.Join([]string{bar.Symbol, bar.TimeFrame}, "_")
+	orm.AddDumpRow(orm.DumpKline, envKey, bar.Kline)
 	err := t.Trader.FeedKline(bar)
 	if err != nil {
 		log.Error("handle bar fail", zap.String("pair", bar.Symbol), zap.Error(err))
 		return
 	}
-	delayExecBatch()
 }
 
 func delayExecBatch() {
@@ -123,6 +127,8 @@ func delayExecBatch() {
 			// There are TF cycles that have not yet been completed, and they are postponed for a few seconds to trigger again
 			// 有尚未完成的tf周期，推迟几秒再次触发
 			delayExecBatch()
+		} else {
+			orm.FlushDumps()
 		}
 	})
 }
@@ -137,6 +143,7 @@ func (t *CryptoTrader) startJobs() {
 		// 监听账户订单流、处理用户下单、消费订单队列
 		biz.StartLiveOdMgr()
 	}
+	t.markUnWarm()
 	// Refresh trading pairs regularly
 	// 定期刷新交易对
 	CronRefreshPairs(t.dp)
@@ -163,7 +170,19 @@ func (t *CryptoTrader) startJobs() {
 	core.Cron.Start()
 }
 
+func (t *CryptoTrader) markUnWarm() {
+	for _, accMap := range strat.AccJobs {
+		for _, jobMap := range accMap {
+			for _, job := range jobMap {
+				job.IsWarmUp = false
+			}
+		}
+	}
+}
+
 func exitCleanUp() {
+	orm.FlushDumps()
+	orm.CloseDump()
 	err := biz.CleanUpOdMgr()
 	if err != nil {
 		log.Error("clean odMgr fail", zap.Error(err))

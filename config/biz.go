@@ -96,7 +96,8 @@ func GetConfig(args *CmdArgs, showLog bool) (*Config, *errs.Error) {
 		}
 	}
 	if len(args.Configs) > 0 {
-		if utils2.IsDocker() {
+		if !outSaved && utils2.IsDocker() {
+			outSaved = true
 			// 对于docker中启动，且传入了额外yml配置的，合并写入到config.local.yml，方便WebUI启动回测时保留额外的yml配置
 			items := make([]string, 0, len(args.Configs)+1)
 			localCfgPath := filepath.Join(GetDataDir(), "config.local.yml")
@@ -115,6 +116,9 @@ func GetConfig(args *CmdArgs, showLog bool) (*Config, *errs.Error) {
 				return nil, err2
 			}
 			args.Configs = nil
+			if args.NoDefault {
+				paths = append(paths, localCfgPath)
+			}
 		} else {
 			paths = append(paths, args.Configs...)
 		}
@@ -214,11 +218,13 @@ func (c *Config) Apply(args *CmdArgs) error {
 		} else {
 			stop = btime.UTCStamp()
 		}
-	} else {
+	} else if strings.TrimSpace(c.TimeRangeRaw) != "" {
 		start, stop, err = ParseTimeRange(c.TimeRangeRaw)
 		if err != nil {
 			return err
 		}
+	} else {
+		return fmt.Errorf("`time_start` in yml is required")
 	}
 	c.TimeRange = &TimeTuple{start, stop}
 	if args.StakeAmount > 0 {
@@ -358,7 +364,8 @@ func ApplyConfig(args *CmdArgs, c *Config) *errs.Error {
 		c.StratPerf.Validate()
 	}
 	StratPerf = c.StratPerf
-	ApplyPairPolicy(c.Pairs, c.RunPolicy)
+	Pairs, _ = utils2.UniqueItems(c.Pairs)
+	SetRunPolicy(true, c.RunPolicy...)
 	if c.PairMgr == nil {
 		c.PairMgr = &PairMgrConfig{}
 	}
@@ -387,25 +394,18 @@ func ApplyConfig(args *CmdArgs, c *Config) *errs.Error {
 	return nil
 }
 
-func ApplyPairPolicy(pairs []string, policies []*RunPolicyConfig) {
-	staticPairs, fixPairs := initPolicies(policies)
-	if len(pairs) > 0 {
-		staticPairs = true
-		fixPairs = append(fixPairs, pairs...)
+// SetRunPolicy set run_policy and their indexs
+func SetRunPolicy(index bool, items ...*RunPolicyConfig) {
+	if items == nil {
+		items = make([]*RunPolicyConfig, 0)
 	}
-	if staticPairs && len(fixPairs) > 0 {
-		pairs, _ = utils2.UniqueItems(fixPairs)
-	}
-	Pairs, _ = utils2.UniqueItems(pairs)
-}
-
-func initPolicies(policyList []*RunPolicyConfig) (bool, []string) {
-	if policyList == nil {
-		policyList = make([]*RunPolicyConfig, 0)
-	}
-	var polPairs []string
-	staticPairs := true
-	for _, pol := range policyList {
+	nameCnts := make(map[string]int)
+	for _, pol := range items {
+		num, _ := nameCnts[pol.Name]
+		if index {
+			pol.Index = num
+		}
+		nameCnts[pol.Name] = num + 1
 		if pol.Params == nil {
 			pol.Params = make(map[string]float64)
 		}
@@ -413,14 +413,13 @@ func initPolicies(policyList []*RunPolicyConfig) (bool, []string) {
 			pol.PairParams = make(map[string]map[string]float64)
 		}
 		pol.defs = make(map[string]*core.Param)
-		if len(pol.Pairs) > 0 {
-			polPairs = append(polPairs, pol.Pairs...)
+		if len(pol.Pairs) == 0 {
+			pol.Pairs = Pairs
 		} else {
-			staticPairs = false
+			pol.Pairs, _ = utils2.UniqueItems(pol.Pairs)
 		}
 	}
-	RunPolicy = policyList
-	return staticPairs, polPairs
+	RunPolicy = items
 }
 
 func GetTakeOverTF(pair, defTF string) string {
@@ -754,33 +753,37 @@ func DumpYaml(desensitize bool) ([]byte, *errs.Error) {
 	return data, nil
 }
 
+// ID return name_index
 func (c *RunPolicyConfig) ID() string {
-	if c.Dirt == "" {
+	if c.Index <= 0 {
 		return c.Name
 	}
-	if c.Dirt == "long" {
-		return c.Name + ":l"
-	} else if c.Dirt == "short" {
-		return c.Name + ":s"
-	} else {
-		panic(fmt.Sprintf("unknown run_policy dirt: %v", c.Dirt))
-	}
+	return fmt.Sprintf("%s_%d", c.Name, c.Index+1)
 }
 
 func (c *RunPolicyConfig) Key() string {
+	name := c.Name
+	dirt := c.OdDirt()
+	if dirt == core.OdDirtLong {
+		name += ":l"
+	} else if dirt == core.OdDirtShort {
+		name += ":s"
+	}
 	tfStr := strings.Join(c.RunTimeframes, "|")
 	pairStr := strings.Join(c.Pairs, "|")
-	return fmt.Sprintf("%s/%s/%s", c.ID(), tfStr, pairStr)
+	return fmt.Sprintf("%s/%s/%s", name, tfStr, pairStr)
 }
 
 func (c *RunPolicyConfig) OdDirt() int {
 	dirt := core.OdDirtBoth
-	if c.Dirt == "long" {
+	text := strings.TrimSpace(c.Dirt)
+	c.Dirt = text
+	if text == "long" {
 		dirt = core.OdDirtLong
-	} else if c.Dirt == "short" {
+	} else if text == "short" {
 		dirt = core.OdDirtShort
-	} else if c.Dirt != "" {
-		panic(fmt.Sprintf("unknown run_policy dirt: %v", c.Dirt))
+	} else if text != "" && text != "any" {
+		panic(fmt.Sprintf("unknown run_policy dirt: %v", text))
 	}
 	return dirt
 }
@@ -794,6 +797,9 @@ func (c *RunPolicyConfig) Param(k string, dv float64) float64 {
 
 func (c *RunPolicyConfig) Def(k string, dv float64, p *core.Param) float64 {
 	val := c.Param(k, dv)
+	if p == nil {
+		return val
+	}
 	if p.Mean == 0 {
 		p.Mean = dv
 	}
@@ -884,6 +890,7 @@ func (c *RunPolicyConfig) ToYaml() string {
 
 func (c *RunPolicyConfig) Clone() *RunPolicyConfig {
 	res := &RunPolicyConfig{
+		Index:         c.Index,
 		Name:          c.Name,
 		Filters:       c.Filters,
 		RunTimeframes: c.RunTimeframes,

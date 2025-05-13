@@ -84,7 +84,7 @@ function getIconTool(id: string, icon: string, color: string, ){
     activeColor: color,
     backgroundColor: 'transparent',
     activeBackgroundColor: 'rgba(22, 119, 255, 0.15)',
-    type: 'iconFont',
+    type: 'icon_font',
     iconFont: {
       content: icon,
       family: 'icomoon'

@@ -52,7 +52,7 @@
     
     <div class="bg-base-200/50 rounded-lg p-4">
       <a class="link link-primary link-hover" onclick={() => loadLogs(false)}>{loadingLogs ? m.loading() : m.load_more()}</a>
-      <pre class="whitespace-pre-wrap font-mono text-sm text-base-content/80">{logs}</pre>
+      <pre class="whitespace-pre-wrap break-all font-mono text-sm text-base-content/80">{logs}</pre>
     </div>
   </div>
 </div>

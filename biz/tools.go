@@ -227,7 +227,7 @@ func LoadZipKline(inPath string, fid int, file *zip.File, arg interface{}) *errs
 		zap.Int("num", len(klines)), zap.String("start", startDt), zap.String("end", endDt))
 	// 这里不可使用数据库默认的归集策略，因有些bar成交量为0；应调用BuildOHLCVOff归集
 	// the database default aggregation strategy cannot be used here, because some bar volumes are 0; BuildOHLCVOff aggregation should be called
-	num, err := sess.InsertKLinesAuto(timeFrame, exs.ID, klines, false)
+	num, err := sess.InsertKLinesAuto(timeFrame, exs, klines, false)
 	if err == nil && num > 0 {
 		// insert data for big timeframes 插入更大周期
 		return aggBigKlines(sess, klines, tfMSecs, exs)
@@ -243,12 +243,13 @@ func aggBigKlines(sess *orm.Queries, klines []*banexg.Kline, tfMSecs int64, exs 
 	klines1m := klines
 	var err *errs.Error
 	var num int64
+	infoBy := exs.InfoBy()
 	for _, agg := range aggList[1:] {
 		if agg.MSecs <= tfMSecs {
 			continue
 		}
 		offMS := int64(exg.GetAlignOff(exs.Exchange, int(agg.MSecs/1000)) * 1000)
-		klines, _ = utils.BuildOHLCV(klines1m, agg.MSecs, 0, nil, tfMSecs, offMS)
+		klines, _ = utils.BuildOHLCV(klines1m, agg.MSecs, 0, nil, tfMSecs, offMS, infoBy)
 		if len(klines) == 0 {
 			continue
 		}
@@ -257,7 +258,7 @@ func aggBigKlines(sess *orm.Queries, klines []*banexg.Kline, tfMSecs int64, exs 
 		if err != nil {
 			return err
 		}
-		num, err = sess.InsertKLinesAuto(agg.TimeFrame, exs.ID, klines, false)
+		num, err = sess.InsertKLinesAuto(agg.TimeFrame, exs, klines, false)
 		if err != nil {
 			return err
 		}
@@ -312,7 +313,7 @@ func AggBigKlines(args *config.CmdArgs) *errs.Error {
 		pBar.Add(1)
 		curStartMS, curEndMS := startMS, firstEndMS
 		for curStartMS < endMS {
-			bars, err := sess.QueryOHLCV(exs.ID, minTF, curStartMS, curEndMS, 0, false)
+			bars, err := sess.QueryOHLCV(exs, minTF, curStartMS, curEndMS, 0, false)
 			if err != nil {
 				return err
 			}
@@ -635,7 +636,7 @@ func CalcCorrelation(args *config.CmdArgs) *errs.Error {
 	if args.OutPath == "" {
 		return errs.NewMsg(errs.CodeParamRequired, "--out is required")
 	}
-	pairs, err := goods.RefreshPairList(false)
+	pairs, err := goods.RefreshPairList(btime.TimeMS())
 	if err != nil {
 		return err
 	}
@@ -892,6 +893,7 @@ func RunHistKline(args *RunHistArgs) *errs.Error {
 func DownExgOrders(args []string) error {
 	var exchange, market, account, pairs string
 	var timeStart, timeEnd string
+	var force bool
 	var configPaths config.ArrString
 	var sub = flag.NewFlagSet("cmp", flag.ExitOnError)
 	sub.Var(&configPaths, "config", "config path to use, Multiple -config options may be used")
@@ -901,6 +903,7 @@ func DownExgOrders(args []string) error {
 	sub.StringVar(&timeStart, "timestart", "", "set start time, allow multiple formats")
 	sub.StringVar(&timeEnd, "timeend", "", "set start time, allow multiple formats")
 	sub.StringVar(&pairs, "pairs", "", "symbols, comma separated")
+	sub.BoolVar(&force, "force", false, "force check from order stamp")
 	err_ := sub.Parse(args)
 	if err_ != nil {
 		return err_
@@ -938,7 +941,7 @@ func DownExgOrders(args []string) error {
 		return err_
 	}
 	pairArr := strings.Split(pairs, ",")
-	err = save.Download(startMS, endMS, pairArr)
+	err = save.Download(startMS, endMS, pairArr, force)
 	if err != nil {
 		return err
 	}
@@ -988,7 +991,7 @@ func GetExgOrderSet(account, exgName, market string) (*ExgOrderSet, *errs.Error)
 }
 
 // Download 下载指定时间范围内的订单记录
-func (s *ExgOrderSet) Download(startMS, endMS int64, pairs []string) *errs.Error {
+func (s *ExgOrderSet) Download(startMS, endMS int64, pairs []string, force bool) *errs.Error {
 	if len(pairs) == 0 {
 		return errs.NewMsg(errs.CodeParamRequired, "pairs is required")
 	}
@@ -1008,6 +1011,10 @@ func (s *ExgOrderSet) Download(startMS, endMS int64, pairs []string) *errs.Error
 			s.Data[pair] = old
 		}
 		var oldStart, oldEnd = old.StartMS, old.EndMS
+		if force && len(old.Orders) > 0 {
+			oldStart = old.Orders[0].Timestamp
+			oldEnd = old.Orders[len(old.Orders)-1].Timestamp + 1
+		}
 
 		var downloadRanges [][2]int64
 		if oldStart == 0 {

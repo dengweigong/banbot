@@ -18,6 +18,7 @@ import (
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	"go.uber.org/zap"
+	"os"
 	"path/filepath"
 )
 
@@ -39,7 +40,7 @@ func RunBackTest(args *config.CmdArgs) *errs.Error {
 		policyList := config.RunPolicy
 		for i, item := range policyList {
 			log.Info("start backtest", zap.Int("id", i+1), zap.String("name", item.Name))
-			config.RunPolicy = []*config.RunPolicyConfig{item}
+			config.SetRunPolicy(true, item)
 			outDir := runBackTest(fmt.Sprintf("%s%d", args.OutPath, i+1), "")
 			err_ := utils.CopyDir(outDir, fmt.Sprintf("%s_%d", outDir, i+1))
 			if err_ != nil {
@@ -77,6 +78,14 @@ func RunTrade(args *config.CmdArgs) *errs.Error {
 	if err != nil {
 		return err
 	}
+	if args.OutPath != "" {
+		file, err_ := os.OpenFile(args.OutPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err_ != nil {
+			log.Error("open live dump file fail", zap.Error(err_))
+		} else {
+			orm.SetDump(file)
+		}
+	}
 	core.BotRunning = true
 	core.StartAt = btime.UTCStamp()
 	t := live.NewCryptoTrader()
@@ -88,7 +97,7 @@ func RunDownData(args *config.CmdArgs) *errs.Error {
 	if err != nil {
 		return err
 	}
-	pairs, err := goods.RefreshPairList(false)
+	pairs, err := goods.RefreshPairList(btime.TimeMS())
 	if err != nil {
 		return err
 	}
@@ -197,6 +206,8 @@ func AggKlineBigs(args *config.CmdArgs) *errs.Error {
 
 func runInit(args *config.CmdArgs) *errs.Error {
 	errs.PrintErr = utils.PrintErr
+	dataDir := config.GetDataDir()
+	fmt.Printf("BanDataDir=%s\n", dataDir)
 	err := biz.InitDataDir()
 	if err != nil {
 		return err

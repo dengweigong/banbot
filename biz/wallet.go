@@ -449,7 +449,11 @@ func (w *BanWallets) EnterOd(od *ormo.InOutOrder) (float64, *errs.Error) {
 	var legalCost float64
 
 	if od.Enter.Amount != 0 {
-		legalCost = od.Enter.Amount * core.GetPrice(od.Symbol)
+		price := od.Enter.Average
+		if price == 0 {
+			price = core.GetPrice(od.Symbol)
+		}
+		legalCost = od.Enter.Amount * price
 	} else {
 		legalCost = od.GetInfoFloat64(ormo.OdInfoLegalCost)
 	}

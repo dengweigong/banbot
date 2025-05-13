@@ -68,7 +68,7 @@ func init() {
 	AddCmdJob(&CmdJob{
 		Name:    "trade",
 		Run:     RunTrade,
-		Options: []string{"stake_amount", "pairs", "with_spider"},
+		Options: []string{"stake_amount", "pairs", "with_spider", "out"},
 		Help:    "live trade",
 	})
 	AddCmdJob(&CmdJob{
@@ -265,6 +265,19 @@ func init() {
 		Parent: "tool",
 		RunRaw: strat.ListStrats,
 		Help:   "list registered strategies",
+	})
+	AddCmdJob(&CmdJob{
+		Name:   "bt_factor",
+		Parent: "tool",
+		RunRaw: opt.BtFactors,
+		Help:   "backtest factors with orders",
+	})
+	AddCmdJob(&CmdJob{
+		Name:    "bt_result",
+		Parent:  "tool",
+		Run:     opt.BuildBtResult,
+		Options: []string{"in", "out"},
+		Help:    "build backtest result from orders.gob and config",
 	})
 
 	AddCmdJob(&CmdJob{

@@ -52,6 +52,7 @@
     exchange: string;
     market: string;
     pairs: string[];
+    env: string;
   }
 
   let data = $state<BotStatus>({
@@ -89,7 +90,8 @@
     runTfs: [],
     exchange: '',
     market: '',
-    pairs: []
+    pairs: [],
+    env: ''
   });
 
   let delayHours = $state(3);
@@ -213,6 +215,8 @@
     <div class="card-body p-4">
       <h2 class="card-title text-lg font-medium mb-3">{m.trading_stats()}</h2>
       <div class="mb-4 flex flex-wrap items-center gap-3">
+        <span class="text-sm text-base-content/70">{m.run_env()}:</span>
+        <span class="text-sm mr-8">{data.env}</span>
         <span class="text-sm text-base-content/70">{m.entry_status()}:</span>
         <span class="text-sm mr-4">{entryStatus}</span>
         <div class="join shadow-sm">
@@ -274,7 +278,9 @@
     <div class="card-body p-4">
       <h2 class="card-title text-lg font-medium mb-3">
         {m.wallet_balance()}
-        <Icon name="refresh" class="size-6 cursor-pointer" onclick={refreshWallet}/>
+        {#if data.env !== 'dry_run'}
+          <Icon name="refresh" class="size-6 cursor-pointer" onclick={refreshWallet}/>
+        {/if}
       </h2>
       {#if data.balanceItems.length > 1}
         <div class="text-base font-medium mb-3 text-primary">{m.total()}: {data.balanceTotal.toFixed(4)}</div>
@@ -283,9 +289,9 @@
         {#each data.balanceItems as item}
           <div class="badge badge-md gap-1.5 py-2.5 px-3 bg-base-200/70 text-base-content border-none">
             <span class="font-medium text-sm">{item.symbol}</span>
-            <span class="text-primary text-sm font-mono">{item.free.toFixed(6)}</span>
-            <span class="text-info text-sm font-mono">/ {item.used.toFixed(6)}</span>
-            <span class="text-info text-sm font-mono">/ {item.upol.toFixed(6)}</span>
+            <span class="text-primary text-sm font-mono" title={m.wallet_total()}>{item.total.toFixed(6)}</span>
+            <span class="text-info text-sm font-mono" title={m.wallet_free()}>/ {item.free.toFixed(6)}</span>
+            <span class="text-info text-sm font-mono" title={m.wallet_upol()}>/ {item.upol.toFixed(6)}</span>
           </div>
         {/each}
       </div>

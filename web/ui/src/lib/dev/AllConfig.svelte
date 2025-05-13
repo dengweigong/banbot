@@ -82,6 +82,7 @@ pairmgr:
   limit: 999  # ${m.cfg_pairmgr_limit()}
   force_filters: false # ${m.cfg_pairmgr_force_filters()}
   pos_on_rotation: hold  # ${m.cfg_pairmgr_pos_on_rotation()}
+  use_latest: false  # ${m.cfg_pairmgr_use_latest()}
 pairlists:  # ${m.cfg_pairlists()}
   - name: VolumePairList  # ${m.cfg_pairlists_vol()}
     limit: 100  # ${m.cfg_pairlists_limit100()}
@@ -177,13 +178,14 @@ webhook:  # ${m.cfg_webhook()}
   exception:
     content: '{name}: {status}'
 api_server:  # ${m.cfg_api_server()}
-  enabled: true
+  enable: true
   bind_ip: 127.0.0.1  # ${m.cfg_api_bind_ip()}
   port: 8001
   jwt_secret_key: fn234njkcu89234nbf
   users:
     - user: ban
       pwd: 123
+      allow_ips: []
       acc_roles: {user1: admin}
 `
   let theme: Extension | null = $state(oneDark);

@@ -187,7 +187,7 @@ func (p *StagedPrg) DelTrigger(name string) {
 
 func (p *StagedPrg) SetProgress(task string, progress float64) {
 	if progress < 0 || progress > 1 {
-		panic(fmt.Sprintf("progress shoud be in [0,1], task: %v", task))
+		log.Warn("progress should be in [0,1]", zap.String("task", task), zap.Float64("prg", progress))
 	}
 	p.lock.Lock()
 	t, ok := p.taskMap[task]

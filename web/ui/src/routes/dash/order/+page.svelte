@@ -467,7 +467,7 @@
 
 <Modal title={m.exchange_details()} bind:show={showExOdDetail} width={800}>
   {#if selectedOrder}
-    <pre class="whitespace-pre-wrap">{JSON.stringify(selectedOrder, null, 2)}</pre>
+    <pre class="whitespace-pre-wrap break-all">{JSON.stringify(selectedOrder, null, 2)}</pre>
   {/if}
 </Modal>
 

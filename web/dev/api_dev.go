@@ -842,9 +842,9 @@ func getBtDetail(c *fiber.Ctx) error {
 			OutDir:  btPath,
 		}
 	}
-	var exsMap map[int32]*orm.ExSymbol
+	var exsMap map[string]*orm.ExSymbol
 	if cfg != nil {
-		exsMap = orm.GetExSymbols(cfg.Exchange.Name, cfg.MarketType)
+		exsMap = orm.GetExSymbolMap(cfg.Exchange.Name, cfg.MarketType)
 	}
 
 	return c.JSON(fiber.Map{
@@ -1325,7 +1325,8 @@ func getSymbolData(c *fiber.Ctx) error {
 	defer conn.Release()
 
 	// 查询K线数据
-	data, err := sess.QueryOHLCV(args.ID, args.TimeFrame, args.StartMS, args.EndMS, args.Limit, false)
+	exs := orm.GetSymbolByID(args.ID)
+	data, err := sess.QueryOHLCV(exs, args.TimeFrame, args.StartMS, args.EndMS, args.Limit, false)
 	if err != nil {
 		return err
 	}

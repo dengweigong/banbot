@@ -2,11 +2,9 @@ package goods
 
 import (
 	"fmt"
-	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm"
-	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	"github.com/go-viper/mapstructure/v2"
@@ -81,21 +79,13 @@ RefreshPairList
 刷新交易品种，如果alignStart=true，则计算当前时间前一个cron的触发时间对应的交易品种
 更新core.Pairs和core.PairsMap
 */
-func RefreshPairList(alignStart bool) ([]string, *errs.Error) {
+func RefreshPairList(timeMS int64) ([]string, *errs.Error) {
 	var pairs []string
 	var allowFilter = false
 	var err *errs.Error
-	curTime := btime.TimeMS()
-	if alignStart && config.PairMgr.Cron != "" {
-		schedule, err_ := utils.NewCronScheduler(config.PairMgr.Cron)
-		if err_ != nil {
-			return nil, err
-		}
-		curTime = utils.CronPrev(schedule, btime.ToTime(curTime)).UnixMilli()
-	}
 	if len(config.Pairs) > 0 {
 		pairs = config.Pairs
-		pairVols, err := getSymbolVols(pairs, "1h", 1, curTime)
+		pairVols, err := getSymbolVols(pairs, "1h", 1, timeMS)
 		if err != nil {
 			return nil, err
 		}
@@ -103,7 +93,7 @@ func RefreshPairList(alignStart bool) ([]string, *errs.Error) {
 		allowFilter = config.PairMgr.ForceFilters
 	} else {
 		allowFilter = true
-		pairs, err = pairProducer.GenSymbols(curTime)
+		pairs, err = pairProducer.GenSymbols(timeMS)
 		if err != nil {
 			return nil, err
 		}
@@ -121,7 +111,7 @@ func RefreshPairList(alignStart bool) ([]string, *errs.Error) {
 				continue
 			}
 			oldNum := len(pairs)
-			pairs, err = flt.Filter(pairs, curTime)
+			pairs, err = flt.Filter(pairs, timeMS)
 			if err != nil {
 				return nil, err
 			}
@@ -148,6 +138,11 @@ func RefreshPairList(alignStart bool) ([]string, *errs.Error) {
 	for _, p := range pairs {
 		core.Pairs = append(core.Pairs, p)
 		core.PairsMap[p] = true
+	}
+	for _, p := range config.RunPolicy {
+		for _, pair := range p.Pairs {
+			core.PairsMap[pair] = true
+		}
 	}
 
 	for pair := range core.BanPairsUntil {

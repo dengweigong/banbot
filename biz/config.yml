@@ -42,6 +42,7 @@ run_policy: []
 #  limit: 999
 #  force_filters: false
 #  pos_on_rotation: hold
+#  use_latest: false
 pairlists:
   - name: VolumePairList
     limit: 100
@@ -118,11 +119,12 @@ webhook:
   exception:
     content: '{name}: {status}'
 api_server:
-  enabled: false
+  enable: false
   bind_ip: 127.0.0.1
   port: 8001
   jwt_secret_key: '123456789'
   users:
     - user: ban
       pwd: '123'
+      allow_ips: []
       acc_roles: {user1: admin}

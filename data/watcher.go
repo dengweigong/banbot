@@ -5,6 +5,7 @@ import (
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/exg"
+	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
@@ -219,7 +220,8 @@ func (w *KLineWatcher) onSpiderBar(key string, data []byte) {
 			olds = append(olds, job.WaitBar)
 		}
 		jobMSecs := int64(job.TFSecs * 1000)
-		finishes = job.getFinishes(utils.BuildOHLCV(bars.Arr, jobMSecs, 0, olds, tfMSecs, job.AlignOffMS))
+		infoBy := orm.GetExSymbol2(exgName, market, pair).InfoBy()
+		finishes = job.getFinishes(utils.BuildOHLCV(bars.Arr, jobMSecs, 0, olds, tfMSecs, job.AlignOffMS, infoBy))
 	} else {
 		finishes = bars.Arr
 	}

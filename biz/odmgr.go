@@ -13,7 +13,6 @@ import (
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	"github.com/banbox/banexg/utils"
-	"github.com/banbox/banta"
 	"go.uber.org/zap"
 	"maps"
 	"math"
@@ -27,10 +26,10 @@ var (
 )
 
 type IOrderMgr interface {
-	ProcessOrders(sess *ormo.Queries, env *banta.BarEnv, enters []*strat.EnterReq,
-		exits []*strat.ExitReq, edits []*ormo.InOutEdit) ([]*ormo.InOutOrder, []*ormo.InOutOrder, *errs.Error)
+	ProcessOrders(sess *ormo.Queries, job *strat.StratJob) ([]*ormo.InOutOrder, []*ormo.InOutOrder, *errs.Error)
+	EditOrder(od *ormo.InOutOrder, action string)
 	RelayOrders(sess *ormo.Queries, orders []*ormo.InOutOrder) *errs.Error
-	EnterOrder(sess *ormo.Queries, env *banta.BarEnv, req *strat.EnterReq, doCheck bool) (*ormo.InOutOrder, *errs.Error)
+	EnterOrder(sess *ormo.Queries, exs *orm.ExSymbol, tf string, req *strat.EnterReq) (*ormo.InOutOrder, *errs.Error)
 	ExitOpenOrders(sess *ormo.Queries, pairs string, req *strat.ExitReq) ([]*ormo.InOutOrder, *errs.Error)
 	ExitOrder(sess *ormo.Queries, od *ormo.InOutOrder, req *strat.ExitReq) (*ormo.InOutOrder, *errs.Error)
 	UpdateByBar(allOpens []*ormo.InOutOrder, bar *orm.InfoKline) *errs.Error
@@ -113,40 +112,34 @@ func CleanUpOdMgr() *errs.Error {
 	return err
 }
 
-func (o *OrderMgr) allowOrderEnter(env *banta.BarEnv, enters []*strat.EnterReq) []*strat.EnterReq {
+func (o *OrderMgr) allowOrderEnter(exs *orm.ExSymbol, tf string, enters []*strat.EnterReq) ([]*strat.EnterReq, map[string]int) {
 	curMS := btime.TimeMS()
-	if banUntil, ok := core.BanPairsUntil[env.Symbol]; ok {
+	rawNum := len(enters)
+	if banUntil, ok := core.BanPairsUntil[exs.Symbol]; ok {
 		if curMS < banUntil {
-			return nil
+			return nil, map[string]int{"BanPair": rawNum}
 		} else {
-			delete(core.BanPairsUntil, env.Symbol)
+			delete(core.BanPairsUntil, exs.Symbol)
 		}
 	}
 	if core.RunMode == core.RunModeOther {
 		// Does not involve order mode, prohibit opening orders
 		// 不涉及订单模式，禁止开单
-		return nil
+		return nil, map[string]int{"NoOrderMode": rawNum}
 	}
-	pairZapField := zap.String("pair", env.Symbol)
+	pairZapField := zap.String("pair", exs.Symbol)
 	stopUntil, _ := core.NoEnterUntil[o.Account]
 	if curMS < stopUntil {
 		if core.LiveMode {
 			log.Warn("any enter forbid", pairZapField)
 		}
 		strat.AddAccFailOpens(o.Account, strat.FailOpenNoEntry, len(enters))
-		return nil
+		return nil, map[string]int{"AccNoEntry": rawNum}
 	}
-	if core.LiveMode {
-		// The real order is submitted to the exchange, and the inspection delay cannot exceed 80%
-		// 实盘订单提交到交易所，检查延迟不能超过80%
-		rate := float64(curMS-env.TimeStop) / float64(env.TimeStop-env.TimeStart)
-		if rate > 0.8 {
-			strat.AddAccFailOpens(o.Account, strat.FailOpenBarTooLate, len(enters))
-			return nil
-		}
-	}
-	if o.BarMS < env.TimeStart {
-		o.BarMS = env.TimeStart
+	tfMSecs := int64(utils.TFToSecs(tf) * 1000)
+	barStopMS := utils.AlignTfMSecs(curMS, tfMSecs)
+	if o.BarMS < barStopMS {
+		o.BarMS = barStopMS
 		o.simulOpen = 0
 		o.simulOpenSt = make(map[string]int)
 	}
@@ -164,7 +157,12 @@ func (o *OrderMgr) allowOrderEnter(env *banta.BarEnv, enters []*strat.EnterReq) 
 		strat.AddAccFailOpens(o.Account, strat.FailOpenNumLimit, orgNum-len(enters))
 	}
 	if len(enters) == 0 {
-		return nil
+		return nil, map[string]int{"OpenTooMuch": rawNum}
+	}
+	numCut := rawNum - len(enters)
+	tagMap := map[string]int{}
+	if numCut > 0 {
+		tagMap["OpenTooMuch"] = numCut
 	}
 	// Check whether the maximum number of orders opened by the strategy is exceeded
 	// 检查是否超出策略最大开单数量
@@ -181,7 +179,7 @@ func (o *OrderMgr) allowOrderEnter(env *banta.BarEnv, enters []*strat.EnterReq) 
 	for _, req := range enters {
 		num, _ := stratOdNum[req.StratName]
 		simulNum, _ := o.simulOpenSt[req.StratName]
-		pol := strat.Get(env.Symbol, req.StratName).Policy
+		pol := strat.Get(exs.Symbol, req.StratName).Policy
 		if pol != nil {
 			if pol.MaxOpen > 0 && num >= pol.MaxOpen {
 				skipNum += 1
@@ -200,7 +198,11 @@ func (o *OrderMgr) allowOrderEnter(env *banta.BarEnv, enters []*strat.EnterReq) 
 	if skipNum > 0 {
 		strat.AddAccFailOpens(o.Account, strat.FailOpenNumLimitPol, skipNum)
 	}
-	return res
+	numCut = rawNum - len(enters)
+	if numCut > 0 {
+		tagMap["OpenTooMuch"] = numCut
+	}
+	return res, tagMap
 }
 
 func checkOrderNum(enters []*strat.EnterReq, oldNum, maxNum int, tag string) []*strat.EnterReq {
@@ -233,13 +235,24 @@ Live trading: monitor the exchange to return the order status to update the entr
 回测：调用方根据下一个bar执行入场/出场订单，更新状态
 实盘：监听交易所返回订单状态更新入场出场
 */
-func (o *OrderMgr) ProcessOrders(sess *ormo.Queries, env *banta.BarEnv, enters []*strat.EnterReq,
-	exits []*strat.ExitReq) ([]*ormo.InOutOrder, []*ormo.InOutOrder, *errs.Error) {
+func (o *OrderMgr) ProcessOrders(sess *ormo.Queries, job *strat.StratJob) ([]*ormo.InOutOrder, []*ormo.InOutOrder, *errs.Error) {
+	enters, exits := job.Entrys, job.Exits
+	if len(enters) == 0 && len(exits) == 0 {
+		return nil, nil, nil
+	}
+	job.Entrys = nil
+	job.Exits = nil
+	exs := job.Symbol
 	var entOrders, extOrders []*ormo.InOutOrder
 	if len(enters) > 0 {
-		enters = o.allowOrderEnter(env, enters)
+		rawNum := len(enters)
+		var reasons map[string]int
+		enters, reasons = o.allowOrderEnter(exs, job.TimeFrame, enters)
+		if core.LiveMode && len(enters) < rawNum {
+			log.Info("skip enters by allowOrderEnter", zap.Any("tags", reasons))
+		}
 		for _, ent := range enters {
-			iorder, err := o.EnterOrder(sess, env, ent, false)
+			iorder, err := o.enterOrder(sess, exs, job.TimeFrame, ent, false)
 			if err != nil {
 				return entOrders, extOrders, err
 			}
@@ -248,14 +261,34 @@ func (o *OrderMgr) ProcessOrders(sess *ormo.Queries, env *banta.BarEnv, enters [
 	}
 	if len(exits) > 0 {
 		for _, exit := range exits {
-			iorders, err := o.ExitOpenOrders(sess, env.Symbol, exit)
+			iorders, err := o.ExitOpenOrders(sess, exs.Symbol, exit)
 			if err != nil {
 				return entOrders, extOrders, err
 			}
 			extOrders = append(extOrders, iorders...)
 		}
 	}
+	if job.Strat.OnOrderChange != nil && (len(entOrders) > 0 || len(extOrders) > 0) {
+		for _, od := range entOrders {
+			job.Strat.OnOrderChange(job, od, strat.OdChgEnter)
+		}
+		for _, od := range extOrders {
+			job.Strat.OnOrderChange(job, od, strat.OdChgExit)
+		}
+		if len(job.Entrys) > 0 || len(job.Exits) > 0 {
+			ents, exts, err := o.ProcessOrders(sess, job)
+			if err != nil {
+				return entOrders, extOrders, err
+			}
+			entOrders = append(entOrders, ents...)
+			extOrders = append(extOrders, exts...)
+		}
+	}
 	return entOrders, extOrders, nil
+}
+
+func (o *LocalOrderMgr) EditOrder(od *ormo.InOutOrder, action string) {
+
 }
 
 func (o *OrderMgr) RelayOrders(sess *ormo.Queries, orders []*ormo.InOutOrder) *errs.Error {
@@ -267,6 +300,7 @@ func (o *OrderMgr) RelayOrders(sess *ormo.Queries, orders []*ormo.InOutOrder) *e
 			return errs.NewMsg(errs.CodeNoMarketForPair, "%s not found", odr.Symbol)
 		}
 		price := core.GetPrice(odr.Symbol)
+		curTime := btime.TimeMS()
 		od := &ormo.InOutOrder{
 			IOrder: &ormo.IOrder{
 				TaskID:    taskId,
@@ -294,7 +328,8 @@ func (o *OrderMgr) RelayOrders(sess *ormo.Queries, orders []*ormo.InOutOrder) *e
 				OrderType: odr.Enter.OrderType,
 				//OrderID:   odr.Enter.OrderID,
 				Side:     odr.Enter.Side,
-				CreateAt: btime.TimeMS(),
+				CreateAt: curTime,
+				UpdateAt: curTime,
 				Price:    price,
 				Amount:   odr.Enter.Amount,
 				Status:   ormo.OdStatusInit,
@@ -323,14 +358,19 @@ func (o *OrderMgr) RelayOrders(sess *ormo.Queries, orders []*ormo.InOutOrder) *e
 	return nil
 }
 
-func (o *OrderMgr) EnterOrder(sess *ormo.Queries, env *banta.BarEnv, req *strat.EnterReq, doCheck bool) (*ormo.InOutOrder, *errs.Error) {
+func (o *OrderMgr) EnterOrder(sess *ormo.Queries, exs *orm.ExSymbol, tf string, req *strat.EnterReq) (*ormo.InOutOrder, *errs.Error) {
+	return o.enterOrder(sess, exs, tf, req, true)
+}
+
+func (o *OrderMgr) enterOrder(sess *ormo.Queries, exs *orm.ExSymbol, tf string, req *strat.EnterReq, doCheck bool) (*ormo.InOutOrder, *errs.Error) {
 	isSpot := core.Market == banexg.MarketSpot
 	if req.Short && isSpot {
 		return nil, errs.NewMsg(core.ErrRunTime, "short oder is invalid for spot")
 	}
 	if doCheck {
-		enters := o.allowOrderEnter(env, []*strat.EnterReq{req})
+		enters, reasons := o.allowOrderEnter(exs, tf, []*strat.EnterReq{req})
 		if len(enters) == 0 {
+			log.Warn("skip enter by allowOrderEnter", zap.Any("reasons", reasons))
 			return nil, nil
 		}
 	}
@@ -340,7 +380,7 @@ func (o *OrderMgr) EnterOrder(sess *ormo.Queries, env *banta.BarEnv, req *strat.
 			exchange := exg.Default
 			exInfo := exchange.Info()
 			if exInfo.FixedLvg {
-				req.Leverage, _ = exchange.GetLeverage(env.Symbol, 0, o.Account)
+				req.Leverage, _ = exchange.GetLeverage(exs.Symbol, 0, o.Account)
 			} else {
 				req.Leverage = config.GetAccLeverage(o.Account)
 			}
@@ -351,31 +391,34 @@ func (o *OrderMgr) EnterOrder(sess *ormo.Queries, env *banta.BarEnv, req *strat.
 	if req.Short {
 		odSide = banexg.OdSideSell
 	}
+	curTimeMS := btime.TimeMS()
 	taskId := ormo.GetTaskID(o.Account)
 	od := &ormo.InOutOrder{
 		IOrder: &ormo.IOrder{
 			TaskID:    taskId,
-			Symbol:    env.Symbol,
-			Sid:       utils.GetMapVal(env.Data, "sid", int64(0)),
-			Timeframe: env.TimeFrame,
+			Symbol:    exs.Symbol,
+			Sid:       int64(exs.ID),
+			Timeframe: tf,
 			Short:     req.Short,
 			Status:    ormo.InOutStatusInit,
 			EnterTag:  req.Tag,
-			InitPrice: core.GetPrice(env.Symbol),
+			InitPrice: core.GetPrice(exs.Symbol),
 			Leverage:  req.Leverage,
-			EnterAt:   btime.TimeMS(),
+			EnterAt:   curTimeMS,
 			Strategy:  req.StratName,
 			StgVer:    int64(stgVer),
 		},
 		Enter: &ormo.ExOrder{
 			TaskID:    taskId,
-			Symbol:    env.Symbol,
+			Symbol:    exs.Symbol,
 			Enter:     true,
 			OrderType: core.OrderTypeEnums[req.OrderType],
 			Side:      odSide,
 			Price:     req.Limit,
 			Amount:    req.Amount,
 			Status:    ormo.OdStatusInit,
+			CreateAt:  curTimeMS,
+			UpdateAt:  curTimeMS,
 		},
 		Info:       map[string]interface{}{},
 		DirtyMain:  true,
@@ -410,6 +453,9 @@ func (o *OrderMgr) EnterOrder(sess *ormo.Queries, env *banta.BarEnv, req *strat.
 			Rate:  req.TakeProfitRate,
 			Tag:   req.TakeProfitTag,
 		})
+	}
+	if req.ClientID != "" {
+		od.SetInfo(ormo.OdInfoClientID, req.ClientID)
 	}
 	err := od.Save(sess)
 	if err != nil {
@@ -573,6 +619,7 @@ func (o *OrderMgr) ExitOpenOrders(sess *ormo.Queries, pairs string, req *strat.E
 		if isTakeProfit && od.Status >= ormo.InOutStatusPartEnter {
 			od.SetTakeProfit(&ormo.ExitTrigger{
 				Price: q.Limit,
+				Limit: q.Limit,
 				Rate:  q.ExitRate,
 				Tag:   q.Tag,
 			})
@@ -633,7 +680,7 @@ func (o *OrderMgr) exitOrder(sess *ormo.Queries, od *ormo.InOutOrder, req *strat
 		}
 		return o.exitOrder(sess, part, req)
 	}
-	od.SetExit(req.Tag, odType, 0)
+	od.SetExit(0, req.Tag, odType, 0)
 	return o.postOrderExit(sess, od)
 }
 

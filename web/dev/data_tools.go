@@ -119,7 +119,7 @@ func runDownloadData(args *DataToolsArgs, pBar *utils.StagedPrg) *errs.Error {
 		return err
 	}
 	for _, pair := range args.Pairs {
-		exs, err := orm.GetExSymbolCur(pair)
+		exs, err := orm.GetExSymbol(exchange, pair)
 		if err != nil {
 			return err
 		}
@@ -222,10 +222,7 @@ func runPurgeData(args *DataToolsArgs, pb *utils.StagedPrg) *errs.Error {
 			continue
 		}
 		exsMap[pair] = true
-		exs, err := orm.GetExSymbolCur(pair)
-		if err != nil {
-			return err
-		}
+		exs := orm.GetExSymbol2(args.Exchange, args.Market, pair)
 		err = sess.DelKData(exs, args.Periods, args.StartMs, args.EndMs)
 		if err != nil {
 			return err

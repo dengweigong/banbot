@@ -12,7 +12,6 @@ import (
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	"github.com/banbox/banexg/utils"
-	"github.com/banbox/banta"
 	"go.uber.org/zap"
 	"strings"
 )
@@ -42,9 +41,8 @@ func InitLocalOrderMgr(callBack FnOdCb, showLog bool) {
 	}
 }
 
-func (o *LocalOrderMgr) ProcessOrders(sess *ormo.Queries, env *banta.BarEnv, enters []*strat.EnterReq,
-	exits []*strat.ExitReq, _ []*ormo.InOutEdit) ([]*ormo.InOutOrder, []*ormo.InOutOrder, *errs.Error) {
-	return o.OrderMgr.ProcessOrders(sess, env, enters, exits)
+func (o *LocalOrderMgr) ProcessOrders(sess *ormo.Queries, job *strat.StratJob) ([]*ormo.InOutOrder, []*ormo.InOutOrder, *errs.Error) {
+	return o.OrderMgr.ProcessOrders(sess, job)
 }
 
 func (o *LocalOrderMgr) UpdateByBar(allOpens []*ormo.InOutOrder, bar *orm.InfoKline) *errs.Error {
@@ -54,15 +52,17 @@ func (o *LocalOrderMgr) UpdateByBar(allOpens []*ormo.InOutOrder, bar *orm.InfoKl
 	// Simulate order entry and exit, which are usually executed at the beginning of the bar
 	// 模拟订单入场出场，入场出场一般在bar开始时执行
 	var curOrders []*ormo.InOutOrder
+	var curMap = make(map[int64]bool)
 	for _, od := range allOpens {
 		if od.Symbol == bar.Symbol {
 			curOrders = append(curOrders, od)
+			curMap[od.ID] = true
 		}
 	}
 	if len(curOrders) == 0 && !core.CheckWallets {
 		return nil
 	}
-	_, err := o.fillPendingOrders(curOrders, bar)
+	curOrders, err := o.fillPendingOrdersAll(curOrders, curMap, bar)
 	if err != nil {
 		return err
 	}
@@ -89,12 +89,52 @@ func (o *LocalOrderMgr) UpdateByBar(allOpens []*ormo.InOutOrder, bar *orm.InfoKl
 	return err
 }
 
+func (o *LocalOrderMgr) fillPendingOrdersAll(orders []*ormo.InOutOrder, curMap map[int64]bool, bar *orm.InfoKline) ([]*ormo.InOutOrder, *errs.Error) {
+	_, err := o.fillPendingOrders(orders, bar)
+	if err != nil {
+		return orders, err
+	}
+	// 在订单事件回调中可能触发新订单入场
+	checkCount := 0
+	for core.NewNumInSim > 0 {
+		openOds, lock := ormo.GetOpenODs(o.Account)
+		var newOds []*ormo.InOutOrder
+		lock.Lock()
+		for _, od := range openOds {
+			if _, ok := curMap[od.ID]; !ok && (bar == nil || od.Symbol == bar.Symbol) {
+				newOds = append(newOds, od)
+				orders = append(orders, od)
+				curMap[od.ID] = true
+			}
+		}
+		lock.Unlock()
+		if len(newOds) > 0 {
+			_, err = o.fillPendingOrders(newOds, bar)
+			if err != nil {
+				return orders, err
+			}
+			checkCount += 1
+			if checkCount > 30 {
+				return orders, errs.NewMsg(errs.CodeRunTime, "OpenOrder in OnOrderChange callstack exceed 30 times")
+			}
+		} else {
+			break
+		}
+	}
+	return orders, nil
+}
+
 /*
 fillPendingOrders
 Fills orders waiting for exchange response. Cannot be used for real trading; can be used for backtesting, simulated real trading, etc.
 填充等待交易所响应的订单。不可用于实盘；可用于回测、模拟实盘等。
 */
 func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, bar *orm.InfoKline) (int, *errs.Error) {
+	core.SimOrderMatch = true
+	core.NewNumInSim = 0
+	defer func() {
+		core.SimOrderMatch = false
+	}()
 	affectNum := 0
 	for _, od := range orders {
 		if bar != nil && bar.TimeFrame != od.Timeframe {
@@ -106,7 +146,7 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, bar *orm.In
 		} else if od.Enter.Status < ormo.OdStatusClosed {
 			exOrder = od.Enter
 		} else {
-			if od.ExitTag == "" {
+			if od.ExitTag == "" && bar != nil {
 				// 已入场完成，尚未出现出场信号，检查是否触发止损The entry has been completed, but the exit signal has not yet appeared. Check whether the stop loss is triggered.
 				err := o.tryFillTriggers(od, &bar.Kline, 0)
 				if err != nil {
@@ -121,8 +161,9 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, bar *orm.In
 		}
 		price := exOrder.Price
 		odTFSecs := utils.TFToSecs(od.Timeframe)
-		fillMS := btime.TimeMS() - int64((float64(odTFSecs)-config.BTNetCost)*1000)
-		fillBarRate := 0.0
+		fillMS := exOrder.CreateAt + int64(config.BTNetCost*1000)
+		barStartMS := utils.AlignTfMSecs(fillMS, int64(odTFSecs*1000))
+		var fillBarRate float64
 		if bar == nil {
 			price = core.GetPrice(od.Symbol)
 		} else if odType == banexg.OdTypeLimit && exOrder.Price > 0 {
@@ -144,17 +185,18 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, bar *orm.In
 				}
 			}
 			odIsBuy := exOrder.Side == banexg.OdSideBuy
-			fillBarRate = simMarketRate(&bar.Kline, exOrder.Price, odIsBuy, false, 0)
+			minRate := float64((exOrder.CreateAt-barStartMS)/1000) / float64(odTFSecs)
+			fillBarRate = simMarketRate(&bar.Kline, exOrder.Price, odIsBuy, false, minRate)
 			fillMS = bar.Time + int64(float64(odTFSecs)*fillBarRate)*1000
 		} else {
 			// 按网络延迟，模拟成交价格，和开盘价接近According to the network delay, the simulated transaction price is close to the opening price
-			rate := config.BTNetCost / float64(odTFSecs)
-			price = simMarketPrice(&bar.Kline, rate)
+			fillBarRate = float64((fillMS-barStartMS)/1000) / float64(odTFSecs)
+			price = simMarketPrice(&bar.Kline, fillBarRate)
 		}
 		var err *errs.Error
 		if exOrder.Enter {
 			err = o.fillPendingEnter(od, price, fillMS)
-			if err == nil {
+			if err == nil && bar != nil {
 				// 入场后可能立刻触发止损/止盈
 				err = o.tryFillTriggers(od, &bar.Kline, fillBarRate)
 			}
@@ -178,7 +220,7 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, bar *orm.In
 		}
 		stopAfter := od.GetInfoInt64(ormo.OdInfoStopAfter)
 		if stopAfter > 0 && stopAfter <= curMS {
-			err := od.LocalExit(core.ExitTagEntExp, od.InitPrice, "reach StopEnterBars", "")
+			err := od.LocalExit(stopAfter, core.ExitTagEntExp, od.InitPrice, "reach StopEnterBars", "")
 			strat.FireOdChange(o.Account, od, strat.OdChgExitFill)
 			if err != nil {
 				log.Error("local exit for StopEnterBars fail", zap.String("key", od.Key()), zap.Error(err))
@@ -193,7 +235,7 @@ func (o *LocalOrderMgr) fillPendingEnter(od *ormo.InOutOrder, price float64, fil
 	_, err := wallets.EnterOd(od)
 	if err != nil {
 		if err.Code == core.ErrLowFunds {
-			err = od.LocalExit(core.ExitTagForceExit, od.InitPrice, err.Error(), "")
+			err = od.LocalExit(fillMS, core.ExitTagForceExit, od.InitPrice, err.Error(), "")
 			strat.FireOdChange(o.Account, od, strat.OdChgExitFill)
 			o.onLowFunds()
 			return err
@@ -228,7 +270,7 @@ func (o *LocalOrderMgr) fillPendingEnter(od *ormo.InOutOrder, price float64, fil
 				num, _ := o.zeroAmts[od.Symbol]
 				o.zeroAmts[od.Symbol] = num + 1
 			}
-			err = od.LocalExit(core.ExitTagFatalErr, od.InitPrice, err.Error(), "")
+			err = od.LocalExit(fillMS, core.ExitTagFatalErr, od.InitPrice, err.Error(), "")
 			_, quote, _, _ := core.SplitSymbol(od.Symbol)
 			wallets.Cancel(od.Key(), quote, 0, true)
 			strat.FireOdChange(o.Account, od, strat.OdChgExitFill)
@@ -242,15 +284,6 @@ func (o *LocalOrderMgr) fillPendingEnter(od *ormo.InOutOrder, price float64, fil
 	exOrder.UpdateAt = updateTime
 	if exOrder.CreateAt == 0 {
 		exOrder.CreateAt = updateTime
-	}
-	if exOrder.OrderType == banexg.OdTypeLimit && updateTime-od.EnterAt < 60000 {
-		// 以限价单入场，但很快成交的话，认为是市价单成交If the limit order is filled quickly, it will be considered a market order.
-		exOrder.OrderType = banexg.OdTypeMarket
-	}
-	if exOrder.Filled == 0 {
-		// 将EnterAt更新为实际入场时间
-		// Update Enter.UpdateAt to the actual entry time
-		od.Enter.UpdateAt = updateTime
 	}
 	exOrder.Filled = exOrder.Amount
 	exOrder.Average = entPrice
@@ -344,6 +377,10 @@ func (o *LocalOrderMgr) tryFillTriggers(od *ormo.InOutOrder, bar *banexg.Kline, 
 		trigPrice = tp.Price
 		amtRate = tp.Rate
 		fillPrice = getExcPrice(od, bar, tp.Price, tp.Limit, afterRate, tfSecs)
+		if fillPrice == 0 && tp.Limit > 0 {
+			// 设置了限价止盈，强制使用止盈价出场
+			fillPrice = tp.Limit
+		}
 		if tp.Tag != "" {
 			exitTag = tp.Tag
 		} else {
@@ -386,16 +423,9 @@ func (o *LocalOrderMgr) tryFillTriggers(od *ormo.InOutOrder, bar *banexg.Kline, 
 		}
 		od = part
 	}
-	err := od.LocalExit(exitTag, fillPrice, "", odType)
 	cutSecs := tfSecs * (1 - rate)
-	od.ExitAt = curMS - int64(cutSecs*1000)
-	od.DirtyMain = true
-	if od.Exit != nil {
-		od.Exit.UpdateAt = od.ExitAt
-		od.Exit.CreateAt = od.ExitAt
-		od.DirtyExit = true
-	}
-	_ = od.Save(nil)
+	exitAt := curMS - int64(cutSecs*1000)
+	err := od.LocalExit(exitAt, exitTag, fillPrice, "", odType)
 	wallets := GetWallets(o.Account)
 	wallets.ExitOd(od, od.Exit.Amount)
 	_ = o.finishOrder(od, nil)
@@ -439,7 +469,14 @@ func (o *LocalOrderMgr) exitAndFill(sess *ormo.Queries, req *strat.ExitReq, bar 
 		return err
 	}
 	if len(orders) > 0 {
-		_, err = o.fillPendingOrders(orders, bar)
+		odMap := make(map[int64]bool)
+		for _, od := range orders {
+			odMap[od.ID] = true
+		}
+		backUntil, _ := core.NoEnterUntil[o.Account]
+		core.NoEnterUntil[o.Account] = btime.TimeMS() + 72*3600*1000
+		_, err = o.fillPendingOrdersAll(orders, odMap, bar)
+		core.NoEnterUntil[o.Account] = backUntil
 		if err != nil {
 			return err
 		}
@@ -481,6 +518,7 @@ func (o *LocalOrderMgr) CleanUp() *errs.Error {
 	lock.Unlock()
 	if len(openOdList) > 0 {
 		exitOds := make([]*ormo.InOutOrder, 0, len(openOdList))
+		odMap := make(map[int64]bool)
 		var iod *ormo.InOutOrder
 		for _, od := range openOdList {
 			iod, err = o.exitOrder(nil, od, exitReq)
@@ -488,9 +526,11 @@ func (o *LocalOrderMgr) CleanUp() *errs.Error {
 				break
 			}
 			exitOds = append(exitOds, iod)
+			odMap[iod.ID] = true
 		}
 		if err == nil {
-			_, err = o.fillPendingOrders(exitOds, nil)
+			core.NoEnterUntil[o.Account] = btime.TimeMS() + 72*3600*1000
+			_, err = o.fillPendingOrdersAll(exitOds, odMap, nil)
 		}
 	}
 	if err != nil {

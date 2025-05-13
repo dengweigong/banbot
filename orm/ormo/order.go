@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"github.com/sasha-s/go-deadlock"
 	"math"
 	"math/rand"
 	"slices"
@@ -12,6 +11,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/sasha-s/go-deadlock"
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
@@ -153,16 +154,16 @@ func (i *InOutOrder) KeyAlign() string {
 	return i.key(timeMS)
 }
 
+// SetEnterLimit set limit price for enter
 func (i *InOutOrder) SetEnterLimit(price float64) *errs.Error {
-	if i.Status >= InOutStatusFullEnter {
+	if i.Status >= InOutStatusFullEnter || i.Enter == nil || i.Enter.Status >= OdStatusClosed {
 		return errs.NewMsg(errs.CodeRunTime, "cannot set entry limit for entered order: %s", i.Key())
 	}
-	if i.Status == InOutStatusInit {
-		i.InitPrice = price
-		i.DirtyMain = true
+	if i.Enter.Price != price {
+		i.Enter.Price = price
+		i.DirtyEnter = true
+		fireOdEdit(i, OdActionLimitEnter)
 	}
-	i.Enter.Price = price
-	i.DirtyEnter = true
 	return nil
 }
 
@@ -282,13 +283,16 @@ func (i *InOutOrder) CanClose() bool {
 	return float64(btime.TimeMS()-i.RealEnterMS()) > float64(tfMSecs)*0.9
 }
 
-func (i *InOutOrder) SetExit(tag, orderType string, limit float64) {
+func (i *InOutOrder) SetExit(exitAt int64, tag, orderType string, limit float64) {
+	if exitAt == 0 {
+		exitAt = btime.TimeMS()
+	}
 	if i.ExitAt == 0 {
 		if tag == "" {
 			tag = core.ExitTagUnknown
 		}
 		i.ExitTag = tag
-		i.ExitAt = btime.TimeMS()
+		i.ExitAt = exitAt
 		i.DirtyMain = true
 	}
 	if i.Exit == nil {
@@ -303,7 +307,8 @@ func (i *InOutOrder) SetExit(tag, orderType string, limit float64) {
 			Enter:     false,
 			OrderType: orderType,
 			Side:      odSide,
-			CreateAt:  btime.TimeMS(),
+			CreateAt:  exitAt,
+			UpdateAt:  exitAt,
 			Price:     limit,
 			Amount:    i.Enter.Filled,
 			Status:    OdStatusInit,
@@ -326,9 +331,9 @@ LocalExit
 Forcefully exiting the order locally takes effect immediately, without waiting for the next bar. This does not involve wallet updates, the wallet needs to be updated on its own.
 When calling this function on a real drive, it will be saved to the database
 在本地强制退出订单，立刻生效，无需等到下一个bar。这里不涉及钱包更新，钱包需要自行更新。
-实盘时调用此函数会保存到数据库
+实盘时调用此函数会持久化存储
 */
-func (i *InOutOrder) LocalExit(tag string, price float64, msg, odType string) *errs.Error {
+func (i *InOutOrder) LocalExit(exitAt int64, tag string, price float64, msg, odType string) *errs.Error {
 	if price == 0 {
 		newPrice := core.GetPrice(i.Symbol)
 		if newPrice > 0 {
@@ -341,10 +346,6 @@ func (i *InOutOrder) LocalExit(tag string, price float64, msg, odType string) *e
 			price = i.InitPrice
 		}
 	}
-	if odType == "" {
-		odType = banexg.OdTypeMarket
-	}
-	i.SetExit(tag, odType, price)
 	if i.Enter.Status < OdStatusClosed {
 		i.Enter.Status = OdStatusClosed
 		err := i.UpdateFee(price, true, true)
@@ -353,10 +354,11 @@ func (i *InOutOrder) LocalExit(tag string, price float64, msg, odType string) *e
 		}
 		i.DirtyEnter = true
 	}
-	i.Exit.Status = OdStatusClosed
-	if i.Exit.Filled == 0 {
-		i.ExitAt = btime.TimeMS()
+	if odType == "" {
+		odType = banexg.OdTypeMarket
 	}
+	i.SetExit(exitAt, tag, odType, price)
+	i.Exit.Status = OdStatusClosed
 	i.Exit.Filled = i.Enter.Filled
 	i.Exit.Average = i.Exit.Price
 	i.Status = InOutStatusFullExit
@@ -466,6 +468,9 @@ func (i *InOutOrder) IsDirty() bool {
 }
 
 func (i *InOutOrder) Save(sess *Queries) *errs.Error {
+	if i.ID == 0 && core.SimOrderMatch {
+		core.NewNumInSim += 1
+	}
 	if core.LiveMode {
 		openOds, lock := GetOpenODs(GetTaskAcc(i.TaskID))
 		lock.Lock()
@@ -627,9 +632,17 @@ func (i *InOutOrder) SetExitTrigger(key string, args *ExitTrigger) {
 	} else {
 		rangeVal = math.Abs(i.InitPrice - args.Price)
 	}
+	var changed = true
+	if tg.ExitTrigger != nil {
+		old := tg.ExitTrigger
+		changed = old.Price != args.Price || old.Limit != args.Limit || old.Rate != args.Rate
+	}
 	tg.Range = rangeVal
 	tg.ExitTrigger = args
 	i.SetInfo(key, tg)
+	if changed {
+		fireOdEdit(i, key)
+	}
 }
 
 func (i *InOutOrder) SetStopLoss(args *ExitTrigger) {
@@ -660,40 +673,17 @@ Generate the exchange's ClientOrderId
 生成交易所的ClientOrderId
 */
 func (i *InOutOrder) ClientId(random bool) string {
+	client := i.GetInfoString(OdInfoClientID)
 	if random {
-		return fmt.Sprintf("%s_%v_%v", config.Name, i.ID, rand.Intn(1000))
+		return fmt.Sprintf("%s_%v_%v_%v", config.Name, i.ID, rand.Intn(1000), client)
 	}
-	return fmt.Sprintf("%s_%v", config.Name, i.ID)
+	return fmt.Sprintf("%s_%v_%v", config.Name, i.ID, client)
 }
 
-type InOutSnap struct {
-	EnterLimit      float64
-	ExitLimit       float64
-	StopLoss        float64
-	TakeProfit      float64
-	StopLossLimit   float64
-	TakeProfitLimit float64
-}
-
-func (i *InOutOrder) TakeSnap() *InOutSnap {
-	snap := &InOutSnap{}
-	if i.Status < InOutStatusFullEnter && i.Enter != nil && i.Enter.Status < OdStatusClosed {
-		snap.EnterLimit = i.Enter.Price
+func fireOdEdit(od *InOutOrder, action string) {
+	if OdEditListener != nil && core.EnvReal && od.Status > InOutStatusInit && od.ID > 0 {
+		OdEditListener(od, action)
 	}
-	if i.Status > InOutStatusFullEnter && i.Exit != nil && i.Exit.Status < OdStatusClosed {
-		snap.ExitLimit = i.Exit.Price
-	}
-	sl := i.GetStopLoss()
-	tp := i.GetTakeProfit()
-	if sl != nil {
-		snap.StopLoss = sl.Price
-		snap.StopLossLimit = sl.Limit
-	}
-	if tp != nil {
-		snap.TakeProfit = tp.Price
-		snap.TakeProfitLimit = tp.Limit
-	}
-	return snap
 }
 
 /*
@@ -755,6 +745,29 @@ func (i *InOutOrder) RealExitMS() int64 {
 		}
 	}
 	return i.ExitAt
+}
+
+func (i *InOutOrder) Clone() *InOutOrder {
+	if i == nil {
+		return nil
+	}
+	clone := &InOutOrder{
+		IOrder:     i.IOrder.Clone(),
+		Enter:      i.Enter.Clone(),
+		Exit:       i.Exit.Clone(),
+		Info:       make(map[string]interface{}),
+		DirtyMain:  i.DirtyMain,
+		DirtyEnter: i.DirtyEnter,
+		DirtyExit:  i.DirtyExit,
+		DirtyInfo:  i.DirtyInfo,
+		idKey:      i.idKey,
+	}
+	if i.Info != nil {
+		for k, v := range i.Info {
+			clone.Info[k] = v
+		}
+	}
+	return clone
 }
 
 func (i *IOrder) saveAdd(sess *Queries) *errs.Error {
@@ -825,6 +838,35 @@ func (i *IOrder) NanInfTo(v float64) {
 	i.ProfitRate = utils.NanInfTo(i.ProfitRate, v)
 	i.MaxPftRate = utils.NanInfTo(i.MaxPftRate, v)
 	i.MaxDrawDown = utils.NanInfTo(i.MaxDrawDown, v)
+}
+
+func (i *IOrder) Clone() *IOrder {
+	if i == nil {
+		return nil
+	}
+	return &IOrder{
+		ID:          i.ID,
+		TaskID:      i.TaskID,
+		Symbol:      i.Symbol,
+		Sid:         i.Sid,
+		Timeframe:   i.Timeframe,
+		Short:       i.Short,
+		Status:      i.Status,
+		EnterTag:    i.EnterTag,
+		InitPrice:   i.InitPrice,
+		QuoteCost:   i.QuoteCost,
+		ExitTag:     i.ExitTag,
+		Leverage:    i.Leverage,
+		EnterAt:     i.EnterAt,
+		ExitAt:      i.ExitAt,
+		Strategy:    i.Strategy,
+		StgVer:      i.StgVer,
+		MaxPftRate:  i.MaxPftRate,
+		MaxDrawDown: i.MaxDrawDown,
+		ProfitRate:  i.ProfitRate,
+		Profit:      i.Profit,
+		Info:        i.Info,
+	}
 }
 
 func (i *ExOrder) saveAdd(sess *Queries) *errs.Error {
@@ -927,6 +969,31 @@ func (i *ExOrder) NanInfTo(v float64) {
 	}
 	i.Price = utils.NanInfTo(i.Price, v)
 	i.Fee = utils.NanInfTo(i.Fee, v)
+}
+
+func (i *ExOrder) Clone() *ExOrder {
+	if i == nil {
+		return nil
+	}
+	return &ExOrder{
+		ID:        i.ID,
+		TaskID:    i.TaskID,
+		InoutID:   i.InoutID,
+		Symbol:    i.Symbol,
+		Enter:     i.Enter,
+		OrderType: i.OrderType,
+		OrderID:   i.OrderID,
+		Side:      i.Side,
+		CreateAt:  i.CreateAt,
+		Price:     i.Price,
+		Average:   i.Average,
+		Amount:    i.Amount,
+		Filled:    i.Filled,
+		Status:    i.Status,
+		Fee:       i.Fee,
+		FeeType:   i.FeeType,
+		UpdateAt:  i.UpdateAt,
+	}
 }
 
 func (q *Queries) getIOrders(sql string, args []interface{}) ([]*IOrder, *errs.Error) {
@@ -1188,8 +1255,8 @@ Retrieve the specified task and the latest usage time period of the specified po
 */
 func (q *Queries) GetHistOrderTfs(taskId int64, stagy string) (map[string]string, *errs.Error) {
 	ctx := context.Background()
-	sql := fmt.Sprintf("select DISTINCT ON (symbol) symbol,timeframe from iorder where task_id=%v and strategy=? ORDER BY symbol, enter_at DESC", taskId)
-	rows, err_ := q.db.QueryContext(ctx, sql, stagy)
+	sqlStr := fmt.Sprintf("select DISTINCT symbol,timeframe from iorder where task_id=%v and strategy=? ORDER BY symbol, enter_at DESC", taskId)
+	rows, err_ := q.db.QueryContext(ctx, sqlStr, stagy)
 	if err_ != nil {
 		return nil, errs.New(core.ErrDbReadFail, err_)
 	}
@@ -1283,6 +1350,23 @@ func LegalDoneProfits(off int) float64 {
 	return total
 }
 
+func CalcTimeRange(odList []*InOutOrder) (int64, int64) {
+	if len(odList) == 0 {
+		return 0, 0
+	}
+	startMS := odList[0].RealEnterMS()
+	endMS := odList[0].RealExitMS()
+	for _, od := range odList {
+		curEnter := od.RealEnterMS()
+		curExit := od.RealExitMS()
+		if curEnter > 0 {
+			startMS = min(startMS, curEnter)
+		}
+		endMS = max(endMS, curExit)
+	}
+	return startMS, endMS
+}
+
 /*
 CalcUnitReturns 计算单位每日回报金额
 
@@ -1293,15 +1377,12 @@ endMS 区间结束时间，13位时间戳
 tfMSecs 单位的毫秒间隔
 */
 func CalcUnitReturns(odList []*InOutOrder, closes []float64, startMS, endMS, tfMSecs int64) ([]float64, int, int) {
-	for _, od := range odList {
-		startMS = min(startMS, od.Enter.CreateAt)
-		endMS = max(endMS, od.Exit.CreateAt)
-	}
 	arrLen := int((endMS - startMS) / tfMSecs)
 	returns := make([]float64, arrLen)
 	dayOff, dayEnd := 0, 0
 	for i, od := range odList {
-		entryAlignMS := utils2.AlignTfMSecs(od.Enter.CreateAt, tfMSecs)
+		entryMS := od.RealEnterMS()
+		entryAlignMS := utils2.AlignTfMSecs(entryMS, tfMSecs)
 		offset := int((entryAlignMS - startMS) / tfMSecs)
 		dirt := float64(1)
 		if od.Short {
@@ -1312,46 +1393,62 @@ func CalcUnitReturns(odList []*InOutOrder, closes []float64, startMS, endMS, tfM
 		}
 		entryPrice := od.Enter.Average
 		exitPrice := od.Exit.Average
-		exitMS := od.Exit.CreateAt
-		priceStep := (exitPrice - entryPrice) / float64((exitMS-entryAlignMS)/tfMSecs+1)
+		exitMS := od.RealExitMS()
+		if exitMS <= entryMS {
+			continue
+		}
+		holdNumF := float64((exitMS-entryAlignMS)/tfMSecs + 1)
+		holdNum := int(math.Ceil(holdNumF))
+		priceStep := (exitPrice - entryPrice) / holdNumF
 		posPrice := entryPrice + priceStep // 模拟每个单位的收盘价
 		enterCost := od.EnterCost()
 
+		rets := make([]float64, holdNum)
+		idx := 0
 		bCode, qCode, _, _ := core.SplitSymbol(od.Symbol)
-		if offset < len(returns) && od.Enter != nil {
+		if od.Enter != nil {
 			if od.Enter.FeeType == qCode {
-				returns[offset] -= od.Enter.Fee
+				rets[idx] -= od.Enter.Fee
 			} else if od.Enter.FeeType == bCode {
-				returns[offset] -= od.Enter.Fee * od.Enter.Average
+				rets[idx] -= od.Enter.Fee * od.Enter.Average
 			}
 		}
 
+		// 计算在每个时间单位上的回报
+		openPrice := entryPrice
 		for entryAlignMS < exitMS {
 			closePrice := exitPrice
 			if exitMS > entryAlignMS+tfMSecs {
-				if offset < len(closes) {
-					closePrice = closes[offset]
+				if offset+idx < len(closes) {
+					closePrice = closes[offset+idx]
 				} else {
 					closePrice = posPrice
 				}
 			}
-			ret := (closePrice/entryPrice - 1) * dirt * enterCost
-			if offset < len(returns) {
-				returns[offset] += ret
+			ret := (closePrice - openPrice) / entryPrice * dirt * enterCost
+			if idx < len(rets) {
+				rets[idx] += ret
 			}
-			offset += 1
+			idx += 1
 			entryAlignMS += tfMSecs
-			entryPrice = closePrice
+			openPrice = closePrice
 			posPrice += priceStep
 		}
-		if offset-1 < len(returns) && od.Exit != nil {
+		if idx-1 < len(rets) && od.Exit != nil {
 			if od.Exit.FeeType == qCode {
-				returns[offset-1] -= od.Exit.Fee
+				rets[idx-1] -= od.Exit.Fee
 			} else if od.Exit.FeeType == bCode {
-				returns[offset-1] -= od.Exit.Fee * od.Exit.Average
+				rets[idx-1] -= od.Exit.Fee * od.Exit.Average
 			}
 		}
-		dayEnd = offset
+		// 累加利润
+		for j, v := range rets {
+			if offset+j >= len(returns) {
+				break
+			}
+			returns[offset+j] += v
+		}
+		dayEnd = offset + len(rets)
 	}
 	return returns, dayOff, dayEnd
 }

@@ -210,105 +210,17 @@ func (s *StratJob) InitBar(curOrders []*ormo.InOutOrder) {
 	s.Exits = nil
 }
 
-func (s *StratJob) SnapOrderStates() map[int64]*ormo.InOutSnap {
-	var res = make(map[int64]*ormo.InOutSnap)
-	orders := s.GetOrders(0)
+func CheckCustomExits(job *StratJob) *errs.Error {
+	orders := job.GetOrders(0)
 	for _, od := range orders {
-		res[od.ID] = od.TakeSnap()
-	}
-	return res
-}
-
-func (s *StratJob) CheckCustomExits(snap map[int64]*ormo.InOutSnap) ([]*ormo.InOutEdit, *errs.Error) {
-	var res []*ormo.InOutEdit
-	var skipSL, skipTP = 0, 0
-	orders := s.GetOrders(0)
-	for _, od := range orders {
-		shot := od.TakeSnap()
-		old, ok := snap[od.ID]
-		if !od.CanClose() || od.Status < ormo.InOutStatusFullEnter {
-			// Not fully entered yet, check if the limit price or trigger price has been updated
-			// 尚未完全入场，检查限价或触发价格是否更新
-			if !ok {
-				continue
-			}
-			if old.EnterLimit != shot.EnterLimit {
-				// Modify the entry price
-				// 修改入场价格
-				res = append(res, &ormo.InOutEdit{
-					Order:  od,
-					Action: ormo.OdActionLimitEnter,
-				})
-			}
-		} else {
-			// Those who have fully entered, check if they have exited
-			// 已完全入场的，检查是否退出
-			slEdit, tpEdit, err := s.checkOrderExit(od)
+		if od.Status >= ormo.InOutStatusFullEnter && od.CanClose() {
+			_, err := job.customExit(od)
 			if err != nil {
-				return res, err
-			}
-			if slEdit != nil {
-				if slEdit.Action == "" {
-					skipSL += 1
-				} else {
-					res = append(res, slEdit)
-				}
-			} else if old != nil && (old.StopLoss != shot.StopLoss || old.StopLossLimit != shot.StopLossLimit) {
-				// Updated stop loss elsewhere
-				// 在其他地方更新了止损
-				res = append(res, &ormo.InOutEdit{Order: od, Action: ormo.OdActionStopLoss})
-			}
-			if tpEdit != nil {
-				if tpEdit.Action == "" {
-					skipSL += 1
-				} else {
-					res = append(res, tpEdit)
-				}
-			} else if old != nil && (old.TakeProfit != shot.TakeProfit || old.TakeProfitLimit != shot.TakeProfitLimit) {
-				// Updated profit taking in other places
-				// 在其他地方更新了止盈
-				res = append(res, &ormo.InOutEdit{Order: od, Action: ormo.OdActionTakeProfit})
-			}
-			if old.ExitLimit != shot.ExitLimit {
-				// Modify the appearance price
-				// 修改出场价格
-				res = append(res, &ormo.InOutEdit{
-					Order:  od,
-					Action: ormo.OdActionLimitExit,
-				})
+				return err
 			}
 		}
 	}
-	if core.LiveMode && skipSL+skipTP > 0 {
-		log.Warn(fmt.Sprintf("%s/%s triggers on exchange is disabled, stoploss: %v, takeprofit: %v",
-			s.Strat.Name, s.Symbol.Symbol, skipSL, skipTP))
-	}
-	return res, nil
-}
-
-func (s *StratJob) checkOrderExit(od *ormo.InOutOrder) (*ormo.InOutEdit, *ormo.InOutEdit, *errs.Error) {
-	sl := od.GetStopLoss().Clone()
-	tp := od.GetTakeProfit().Clone()
-	req, err := s.customExit(od)
-	if err != nil || req != nil {
-		return nil, nil, err
-	}
-	var slEdit, tpEdit *ormo.InOutEdit
-	newSL := od.GetStopLoss()
-	newTP := od.GetTakeProfit()
-	// Check if the condition sheet needs to be modified
-	// 检查是否需要修改条件单
-	if sl != nil || newSL != nil {
-		if sl == nil || newSL == nil || sl.Price != newSL.Price || sl.Limit != newSL.Limit {
-			slEdit = &ormo.InOutEdit{Order: od, Action: ormo.OdActionStopLoss}
-		}
-	}
-	if tp != nil || newTP != nil {
-		if tp == nil || newTP == nil || tp.Price != newTP.Price || tp.Limit != newTP.Limit {
-			tpEdit = &ormo.InOutEdit{Order: od, Action: ormo.OdActionTakeProfit}
-		}
-	}
-	return slEdit, tpEdit, nil
+	return nil
 }
 
 /*
@@ -520,8 +432,28 @@ func FireOdChange(acc string, od *ormo.InOutOrder, evt int) {
 	subs2, _ := accOdSubs["*"]
 	lockOdSub.Unlock()
 	subs = append(subs, subs2...)
+	// 将模拟时间置为事件触发时间，并备份当前时间
+	evtTime := int64(0)
+	if evt == OdChgEnter {
+		evtTime = od.Enter.CreateAt
+	} else if evt == OdChgEnterFill {
+		evtTime = od.Enter.UpdateAt
+	} else if evt == OdChgExit {
+		evtTime = od.Exit.CreateAt
+	} else if evt == OdChgExitFill && od.Exit != nil {
+		evtTime = od.Exit.UpdateAt
+	}
+	backMS := int64(0)
+	if evtTime > 0 {
+		backMS = btime.TimeMS()
+		btime.CurTimeMS = evtTime
+	}
 	for _, cb := range subs {
 		cb(acc, od, evt)
+	}
+	// 恢复原始时间
+	if evtTime > 0 {
+		btime.CurTimeMS = backMS
 	}
 }
 
@@ -546,9 +478,9 @@ func (w Warms) Update(pair, tf string, num int) {
 /*
 JobForbidType 0 allow; 1 forbid; 2 forbid & occupy a slot
 */
-func JobForbidType(pair, tf, stratName string) int {
+func JobForbidType(pair, tf, stratID string) int {
 	if jobs, ok := ForbidJobs[fmt.Sprintf("%s_%s", pair, tf)]; ok {
-		hold, ok2 := jobs[stratName]
+		hold, ok2 := jobs[stratID]
 		if ok2 {
 			if hold {
 				return 2
@@ -653,4 +585,40 @@ func (a accStratLimits) tryAdd(acc, name string) bool {
 		return li.tryAdd(name)
 	}
 	return true
+}
+
+/*
+PrintStratGroups
+print strategy+timeframe from `core.StgPairTfs`
+从core.StgPairTfs输出策略+时间周期的币种信息到控制台
+*/
+func PrintStratGroups() {
+	text := core.GroupByPairQuotes(map[string][]string{"Pairs": core.Pairs}, false)
+	log.Info("global pairs", zap.String("res", "\n"+text))
+	for acc, jobMap := range AccJobs {
+		allows := make(map[string][]string)
+		disables := make(map[string][]string)
+		for pairTF, stratMap := range jobMap {
+			arrP := strings.Split(pairTF, "_")
+			pair, tf := arrP[0], arrP[1]
+			for stratID := range stratMap {
+				key := fmt.Sprintf("%s_%s", stratID, tf)
+				if ok, _ := core.PairsMap[pair]; ok {
+					arr, _ := allows[key]
+					allows[key] = append(arr, pair)
+				} else {
+					arr, _ := disables[key]
+					disables[key] = append(arr, pair)
+				}
+			}
+		}
+		if len(allows) > 0 {
+			text := core.GroupByPairQuotes(allows, true)
+			log.Info("group jobs by strat_tf", zap.String("acc", acc), zap.String("res", "\n"+text))
+		}
+		if len(disables) > 0 {
+			text := core.GroupByPairQuotes(disables, true)
+			log.Info("group disable jobs by strat_tf", zap.String("acc", acc), zap.String("res", "\n"+text))
+		}
+	}
 }

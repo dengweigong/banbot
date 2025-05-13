@@ -1,5 +1,5 @@
 name: local  # 机器人名称，用于在消息通知中区分不同机器人
-env: prod  # 运行环境，prod表示生产网络，test表示测试网络（币安测试网），dry_run表示模拟
+env: prod  # 运行环境，prod表示生产网络，test表示测试网络，dry_run表示模拟实盘交易
 leverage: 2  # 杠杆倍数，仅期货合约市场有效
 limit_vol_secs: 5  # 按成交量取订单簿价格的过期时间，单位：秒，默认10
 put_limit_secs: 120  # 在此预期时间内能成交的限价单，才提交到交易所，单位：秒，默认120
@@ -75,6 +75,7 @@ pairmgr:
   limit: 999 # 标的列表最多保留n个
   force_filters: false  # 是否对pairs应用pairlists，默认false
   pos_on_rotation: hold  # hold/close 品种列表切换时，持仓保留还是立刻平仓
+  use_latest: false  # 未启用cron时，是否使用最新时间刷新品种，仅对回测生效
 pairlists:  # 交易对过滤器，按从上到下的顺序逐个过滤应用。
   - name: VolumePairList  # 按成交量价值倒序排序所有交易对
     limit: 100  # 取前100个
@@ -172,11 +173,12 @@ webhook:  # 发送消息的配置
   exception:
     content: '{name}: {status}'
 api_server:  # 供外部通过api控制机器人
-  enabled: true
+  enable: true
   bind_ip: 127.0.0.1
   port: 8001
   jwt_secret_key: nj234hujivhguih2rj3y4234nkjoghfy9088weurt
   users:
     - user: ban
       pwd: 123
+      allow_ips: []
       acc_roles: {user1: admin}

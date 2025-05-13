@@ -151,7 +151,7 @@
         </div>
         
         <!-- 日志内容 -->
-        <pre class="flex-1 overflow-auto whitespace-pre-wrap">{logs}</pre>
+        <pre class="flex-1 overflow-auto whitespace-pre-wrap break-all">{logs}</pre>
       </div>
     </div>
   </div>

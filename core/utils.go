@@ -2,7 +2,6 @@ package core
 
 import (
 	"fmt"
-	"github.com/banbox/banexg/log"
 	"github.com/banbox/banexg/utils"
 	"regexp"
 	"slices"
@@ -15,10 +14,12 @@ format `[key]:pairs...` as below
 【key】
 Quote: Base1 Base2 ...
 */
-func GroupByPairQuotes(items map[string][]string) string {
+func GroupByPairQuotes(items map[string][]string, doSort bool) string {
 	res := make(map[string]map[string][]string)
 	for key, arr := range items {
-		slices.Sort(arr)
+		if doSort {
+			slices.Sort(arr)
+		}
 		quoteMap := make(map[string][]string)
 		for _, pair := range arr {
 			baseCode, quoteCode, _, _ := SplitSymbol(pair)
@@ -26,7 +27,9 @@ func GroupByPairQuotes(items map[string][]string) string {
 			quoteMap[quoteCode] = append(baseList, baseCode)
 		}
 		for quote, baseList := range quoteMap {
-			slices.Sort(baseList)
+			if doSort {
+				slices.Sort(baseList)
+			}
 			quoteMap[quote] = baseList
 		}
 		res[key] = quoteMap
@@ -40,34 +43,6 @@ func GroupByPairQuotes(items map[string][]string) string {
 		}
 	}
 	return b.String()
-}
-
-/*
-PrintStratGroups
-print strategy+timeframe from `core.StgPairTfs`
-从core.StgPairTfs输出策略+时间周期的币种信息到控制台
-*/
-func PrintStratGroups() {
-	allows := make(map[string][]string)
-	disables := make(map[string][]string)
-	for stagy, pairMap := range StgPairTfs {
-		for pair, tf := range pairMap {
-			key := fmt.Sprintf("%s_%s", stagy, tf)
-			if ok, _ := PairsMap[pair]; ok {
-				arr, _ := allows[key]
-				allows[key] = append(arr, pair)
-			} else {
-				arr, _ := disables[key]
-				disables[key] = append(arr, pair)
-			}
-		}
-	}
-	text := GroupByPairQuotes(allows)
-	log.Info("group pairs by strat_tf:\n" + text)
-	if len(disables) > 0 {
-		text = GroupByPairQuotes(disables)
-		log.Info("group disable pairs by strat_tf:\n" + text)
-	}
 }
 
 var (

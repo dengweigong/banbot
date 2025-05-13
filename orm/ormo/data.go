@@ -10,9 +10,10 @@ var (
 	lockOds        = map[string]*deadlock.Mutex{}                  // Modify the lock of the order to prevent concurrent modification 修改订单的锁，防止并发修改
 	mLockOds       deadlock.Mutex
 	mOpenLock      deadlock.Mutex
-	HistODs        []*InOutOrder          // Historical orders, used as storage for backtesting. 历史订单，回测时作为存储用
-	doneODs        = make(map[int64]bool) // 用于防止重复添加到HistODs
-	FakeOdId       = int64(1)             // Virtual order ID, used for temporary maintenance during backtesting. 虚拟订单ID，用于回测时临时维护
+	HistODs        []*InOutOrder             // Historical orders, used as storage for backtesting. 历史订单，回测时作为存储用
+	doneODs        = make(map[int64]bool)    // 用于防止重复添加到HistODs
+	FakeOdId       = int64(1)                // Virtual order ID, used for temporary maintenance during backtesting. 虚拟订单ID，用于回测时临时维护
+	OdEditListener func(*InOutOrder, string) // 订单修改的监听
 )
 
 const (
@@ -39,6 +40,7 @@ const (
 	OdInfoStopAfter  = "StopAfter"
 	OdInfoStopLoss   = "StopLoss"
 	OdInfoTakeProfit = "TakeProfit"
+	OdInfoClientID   = "ClientID"
 )
 
 const (

@@ -295,3 +295,26 @@ func SplitDigits(s string) []string {
 
 	return result
 }
+
+func SetLogCap(path string) {
+	if LogFile == path {
+		return
+	}
+	if CapOut != nil {
+		CapOut.Stop()
+	}
+	var err error
+	CapOut, err = log.NewOutCaptureToFile(path, "")
+	if err != nil {
+		log.Error("new out capture fail", zap.Error(err))
+		LogFile = ""
+	} else {
+		CapOut.Start()
+		LogFile = path
+	}
+	ExitCalls = append(ExitCalls, func() {
+		if CapOut != nil {
+			CapOut.Stop()
+		}
+	})
+}

@@ -1,9 +1,21 @@
 <script lang="ts">
   import * as m from '$lib/paraglide/messages.js'
   import Icon from '$lib/Icon.svelte'
-  import {getLocale} from "$lib/paraglide/runtime";
+  import {getLocale, localizeHref} from "$lib/paraglide/runtime";
+  import {onMount} from "svelte";
+  import {getApi} from "$lib/netio";
+  import {goto} from "$app/navigation";
 
   let showQRCode = $state(false)
+
+  onMount(() => {
+    // /ping可访问表示处于实时模式，跳转到DashBoard
+    getApi('/ping').then(rsp => {
+      if (rsp.code == 200){
+        goto(localizeHref('/dash'))
+      }
+    })
+  })
 </script>
 
 <main class="flex-1 flex items-center justify-center">

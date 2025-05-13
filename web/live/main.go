@@ -2,6 +2,7 @@ package live
 
 import (
 	"fmt"
+	"github.com/banbox/banexg/utils"
 	"strings"
 
 	"github.com/banbox/banbot/config"
@@ -22,6 +23,7 @@ func StartApi() *errs.Error {
 	app := fiber.New(fiber.Config{
 		AppName:      "banbot",
 		ErrorHandler: base.ErrHandler,
+		JSONEncoder:  utils.Marshal,
 	})
 
 	app.Use(cors.New(cors.Config{

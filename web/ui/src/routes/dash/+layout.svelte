@@ -1,28 +1,22 @@
 <script lang="ts">
   import { page } from '$app/state';
   import Icon from '$lib/Icon.svelte';
-  import {ctx, save, acc, loadAccounts} from '$lib/dash/store';
+  import {ctx, save, acc, loadAccounts, activeAcc} from '$lib/dash/store';
   import type { BotAccount, BotTicket } from '$lib/dash/types';
   import * as m from '$lib/paraglide/messages.js';
   import { alerts } from '$lib/stores/alerts';
-  import { loadBotAccounts } from '$lib/dash/store';
   import AddBot from '$lib/dash/AddBot.svelte';
   import Modal from '$lib/kline/Modal.svelte';
   import {site} from '$lib/stores/site';
   import {localizeHref} from "$lib/paraglide/runtime";
+  import {onMount} from "svelte";
 
   let { children } = $props();
   let collapsed = $state(false);
   let showAddBot = $state(false);
   $site.apiReady = false;
-  loadAccounts().then(() => {
-    $site.apiHost = $acc.url;
-    $site.apiReady = true;
-    $site.apiReadyCbs.forEach(cb => cb());
-    $site.apiReadyCbs = [];
-  })
   
-  const menuItems = [
+  let menuItems = $state([
     { path: localizeHref('/dash/board'), icon: 'home', text: m.home() },
     { path: localizeHref('/dash/strat_job'), icon: 'square-stack-3', text: m.strat_job() },
     { path: localizeHref('/dash/kline'), icon: 'chart-bar', text: m.kline() },
@@ -32,10 +26,10 @@
     { path: localizeHref('/dash/setting'), icon: 'setting', text: m.config() },
     { path: localizeHref('/dash/tool'), icon: 'tool', text: m.tools() },
     { path: localizeHref('/dash/log'), icon: 'document-text', text: m.logs() }
-  ];
+  ]);
 
   function clickAccount(acc: BotAccount) {
-    $save.current = `${acc.url}_${acc.account}`;
+    activeAcc(acc)
     location.reload();
   }
   
@@ -43,7 +37,6 @@
     const num = Object.keys(info.accounts!).length
     alerts.success(`${m.add_bot_ok()}: ${info.name} (${num} accounts)`);
     showAddBot = false;
-    loadBotAccounts(info);
   }
 
   function toggleCollapse(){
@@ -52,6 +45,18 @@
       window.dispatchEvent(new Event('resize'));
     }, 500)
   }
+
+  onMount(async () => {
+    loadAccounts().then(() => {
+      if($acc.env === 'dry_run'){
+        menuItems.splice(5, 1);
+      }
+      $site.apiHost = $acc.url;
+      $site.apiReady = true;
+      $site.apiReadyCbs.forEach(cb => cb());
+      $site.apiReadyCbs = [];
+    })
+  });
 </script>
 
 <Modal title={m.add_bot()} bind:show={showAddBot} buttons={[]}>
@@ -104,7 +109,7 @@
                 {#each $ctx.accounts as acc}
                   <li>
                     <a 
-                      class={`rounded-md py-1.5 px-3 text-sm hover:bg-base-200 transition-colors ${`${acc.url}_${acc.account}` === $save.current ? 'bg-primary/90 text-primary-content' : ''}`}
+                      class={`rounded-md py-1.5 px-3 text-sm hover:bg-base-200 transition-colors ${acc.id === $save.current ? 'bg-primary/90 text-primary-content' : ''}`}
                       onclick={() => clickAccount(acc)}
                     >
                       {acc.name}/{acc.account}

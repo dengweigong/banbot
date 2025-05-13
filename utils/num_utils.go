@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"cmp"
 	"fmt"
 	"github.com/muesli/clusters"
 	"github.com/muesli/kmeans"
@@ -268,4 +269,57 @@ rate默认1，x偏移40时，衰减70%；rate>1时，衰减加速
 */
 func NearScore(x, mid, rate float64) float64 {
 	return math.Exp(-math.Abs(x-mid) * rate * 0.03)
+}
+
+type ValIdx[T cmp.Ordered] struct {
+	Val T
+	Idx int
+}
+
+// ArgSortDesc 返回float64切片降序排序后对应的原始索引
+func ArgSortDesc[T cmp.Ordered](values []T) []int {
+	// 创建索引值对的切片
+	indexed := make([]*ValIdx[T], len(values))
+	for i, v := range values {
+		indexed[i] = &ValIdx[T]{Val: v, Idx: i}
+	}
+
+	// 对索引值对进行排序
+	slices.SortFunc(indexed, func(a, b *ValIdx[T]) int {
+		return -cmp.Compare(a.Val, b.Val)
+	})
+
+	// 提取排序后的索引
+	indices := make([]int, len(values))
+	for i, v := range indexed {
+		indices[i] = v.Idx
+	}
+
+	return indices
+}
+
+// CalcDrawDown calculate drawDownRate & drawDownVal for input real assets
+func CalcDrawDown(reals []float64, viewNum int) (float64, float64) {
+	var drawDownRate, maxReal, drawDownVal float64
+	if len(reals) > 0 {
+		stop := len(reals)
+		step := 1
+		if viewNum > 0 && stop*2 > viewNum*3 {
+			step = max(1, int(math.Round(float64(stop)/float64(viewNum))))
+		}
+		maxReal = reals[0]
+		for i := step; i < stop; i += step {
+			val := reals[i]
+			if val > maxReal {
+				maxReal = val
+			} else {
+				drawDownVal = max(drawDownVal, maxReal-val)
+				curDown := math.Abs(val/maxReal - 1)
+				if curDown > drawDownRate {
+					drawDownRate = curDown
+				}
+			}
+		}
+	}
+	return drawDownRate, drawDownVal
 }

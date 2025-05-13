@@ -1,21 +1,20 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import * as m from '$lib/paraglide/messages.js'
-  import type { BotTicket, BotAccount } from '$lib/dash/types';
+  import type { BotTicket } from '$lib/dash/types';
   import AddBot from '$lib/dash/AddBot.svelte';
   import { alerts } from '$lib/stores/alerts';
   import { modals } from '$lib/stores/modals';
-  import { ctx, save, loadBotAccounts, loadAccounts } from '$lib/dash/store';
+  import {ctx, save, loadAccounts, activeAcc} from '$lib/dash/store';
   import {localizeHref, getLocale} from "$lib/paraglide/runtime";
 
   let showAdd = false;
   let activeTab = 'accounts';
 
-  async function loginOk(info: BotTicket) {
+  function loginOk(info: BotTicket) {
     const num = Object.keys(info.accounts!).length
     alerts.success(`${m.add_bot_ok()}: ${info.name} (${num} accounts)`);
     showAdd = false;
-    await loadBotAccounts(info);
   }
 
   async function delTicket(ticket: BotTicket) {
@@ -33,8 +32,22 @@
     await loadAccounts(true);
   }
 
-  function viewAccount(account: BotAccount) {
-    $save.current = `${account.url}_${account.account}`;
+  function accStateText(status: string | undefined): string{
+    switch(status){
+      case 'running': return m.running();
+      case 'stopped': return m.stopped();
+      case 'disconnected': return m.disconnected();
+      default: return "unknown";
+    }
+  }
+
+  function accStateClass(status: string | undefined): string{
+    switch(status){
+      case 'running': return 'badge-success';
+      case 'stopped': return 'badge-warning';
+      case 'disconnected': return 'badge-neutral';
+      default: return "";
+    }
   }
 
   onMount(async () => {
@@ -86,16 +99,18 @@
                   </td>
                   <td class="text-sm">{acc.role}</td>
                   <td>
-                      <span class="badge badge-sm {acc.running ? 'badge-success' : 'badge-warning'} font-normal">
-                        {acc.running ? m.running() : m.stopped()}
+                      <span class="badge badge-sm {accStateClass(acc.status)} font-normal">
+                        {accStateText(acc.status)}
                       </span>
                   </td>
                   <td class="text-right font-mono text-sm">{acc.dayDonePft?.toFixed(2)}[{acc.dayDoneNum}]</td>
                   <td class="text-right font-mono text-sm">{acc.dayOpenPft?.toFixed(2)}[{acc.dayOpenNum}]</td>
                   <td>
-                    <a class="btn btn-xs btn-primary" href={localizeHref("/dash/board")} onclick={() => viewAccount(acc)}>
-                      {m.view()}
-                    </a>
+                    {#if acc.status !== 'disconnected'}
+                      <a class="btn btn-xs btn-primary" href={localizeHref("/dash/board")} onclick={() => activeAcc(acc)}>
+                        {m.view()}
+                      </a>
+                    {/if}
                   </td>
                 </tr>
               {/each}

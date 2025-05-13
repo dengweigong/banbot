@@ -1,3 +1,4 @@
+market_type: spot
 time_start: "20230701"
 time_end: "20250101"
 pairs: ['ETH/USDT']

@@ -108,7 +108,7 @@
 </script>
 
 <Modal title={activeStgy} bind:show={showCode}>
-  <pre class="overflow-auto max-h-[63vh] h-[800px] p-3 bg-base-200/70 rounded-lg text-sm font-mono">{stgyContent}</pre>
+  <pre class="overflow-auto max-h-[63vh] h-[800px] p-3 bg-base-200/70 rounded-lg text-sm font-mono break-all">{stgyContent}</pre>
 </Modal>
 
 <div class="bg-base-100 p-4 min-h-[600px] border border-base-200 flex">

@@ -269,7 +269,7 @@ func loadExgOrders(account, exgName, market string, startMS, endMS int64, pairNu
 		return nil, err
 	}
 	pairs := utils.KeysOfMap(pairNums)
-	err = save.Download(startMS, endMS, pairs)
+	err = save.Download(startMS, endMS, pairs, true)
 	if err != nil {
 		return nil, err
 	}
@@ -311,8 +311,9 @@ func readBackTestOrders(path string) ([]*ormo.InOutOrder, map[string]int, int64,
 		if tfSecs > maxTfSecs {
 			maxTfSecs = tfSecs
 		}
-		if startMS == 0 || od.Enter.CreateAt < startMS {
-			startMS = od.Enter.CreateAt
+		curEntMS := od.RealEnterMS()
+		if startMS == 0 || curEntMS < startMS {
+			startMS = curEntMS
 			startTFSecs = tfSecs
 		}
 		if od.Exit != nil && od.Exit.UpdateAt > endMS {
@@ -683,4 +684,331 @@ func readAssetHtml(file, prefix string, useRate bool) (*AssetData, *errs.Error) 
 	}
 
 	return &data, nil
+}
+
+type FacArgs struct {
+	Pairs        []*PairStat
+	AvgOrderCost float64 // Avg Enter Cost for all orders
+	TimeFrame    string
+	TFMSecs      int64
+	StartMS      int64
+	EndMS        int64
+	MinBack      string // 最小回顾历史周期
+	MaxBack      string // 最大回顾历史周期
+	Interval     string // 重新轮动的间隔
+	MinBackMS    int64
+	MaxBackMS    int64
+	IntervalMS   int64
+}
+
+var (
+	FactorMap = make(map[string]func(FacArgs) ([]string, error))
+)
+
+/*
+BtFactors 从全品种回测订单，对给定的截面因子进行滚动回测，输出回测结果到控制台和目录
+*/
+func BtFactors(args []string) error {
+	var configPaths config.ArrString
+	var factor, inPath, outDir, minBack, maxBack, runPeriod string
+	var downKline bool
+	var sub = flag.NewFlagSet("fac", flag.ExitOnError)
+	sub.Var(&configPaths, "config", "config path to use, Multiple -config options may be used")
+	sub.StringVar(&factor, "factor", "", "factor to test")
+	sub.StringVar(&inPath, "in", "", "path for all pairs orders e.g.: orders.gob")
+	sub.StringVar(&outDir, "out", "", "dump result to directory")
+	sub.StringVar(&minBack, "min-back", "1y", "min look back period")
+	sub.StringVar(&maxBack, "max-back", "2y", "max look back period")
+	sub.StringVar(&runPeriod, "interval", "4M", "interval time range between refreshes")
+	sub.BoolVar(&downKline, "down", false, "try download klines")
+	err_ := sub.Parse(args)
+	if err_ != nil {
+		return err_
+	}
+	if outDir != "" {
+		outDir = config.ParsePath(outDir)
+		err_ = utils.EnsureDir(outDir, 0755)
+		if err_ != nil {
+			return err_
+		}
+		core.SetLogCap(filepath.Join(outDir, "out.log"))
+	}
+	core.SetRunMode(core.RunModeBackTest)
+	err := biz.SetupComsExg(&config.CmdArgs{
+		Configs: configPaths,
+	})
+	if err != nil {
+		return err
+	}
+	var startMs = config.TimeRange.StartMS
+	var endMS = config.TimeRange.EndMS
+	if len(config.StakeCurrency) == 0 {
+		return errors.New("`stake_currency` in yml is required")
+	}
+	var tfSecs int
+	var orders []*ormo.InOutOrder
+	if inPath == "" {
+		return errors.New("-in is required")
+	} else {
+		inPath = config.ParsePath(inPath)
+	}
+	facFunc, ok := FactorMap[factor]
+	if !ok || facFunc == nil {
+		return errors.New("-factor invalid")
+	}
+	orders, err = ormo.LoadOrdersGob(inPath)
+	if err != nil {
+		return err
+	}
+	var exsMap = make(map[int32]*orm.ExSymbol)
+	var pairMap = make(map[string]int32)
+	var totalCost float64
+	var validOdNum int
+	if len(orders) > 0 {
+		startMs = orders[0].RealEnterMS()
+		endMS = orders[0].RealExitMS()
+		for _, od := range orders {
+			curStart := od.RealEnterMS()
+			if curStart < startMs && curStart > 0 {
+				startMs = curStart
+			}
+			curEnd := od.RealExitMS()
+			if curEnd > endMS {
+				endMS = curEnd
+			}
+			tfSecs = max(tfSecs, utils2.TFToSecs(od.Timeframe))
+			curCost := od.EnterCost()
+			if curCost > 0 {
+				totalCost += curCost
+				validOdNum += 1
+			}
+			if _, ok = pairMap[od.Symbol]; !ok {
+				exs, err := orm.GetExSymbolCur(od.Symbol)
+				if err != nil {
+					return err
+				}
+				exsMap[exs.ID] = exs
+				pairMap[od.Symbol] = exs.ID
+			}
+		}
+	} else {
+		return errors.New("orders is empty")
+	}
+	if validOdNum == 0 {
+		return errors.New("no valid orders")
+	}
+	if tfSecs == 0 {
+		tfSecs = utils2.TFToSecs("1d")
+	}
+	minBackMSecs := int64(utils2.TFToSecs(minBack) * 1000)
+	maxBackMSecs := int64(utils2.TFToSecs(maxBack) * 1000)
+	intvMSecs := int64(utils2.TFToSecs(runPeriod) * 1000)
+	dayMSecs := int64(utils2.TFToSecs("1d") * 1000)
+	if intvMSecs < dayMSecs {
+		return errors.New("interval must >= 1d")
+	}
+	if minBackMSecs > maxBackMSecs {
+		return errors.New("min-back must <= max-back")
+	}
+	if minBackMSecs < intvMSecs {
+		return errors.New("min-back must >= interval")
+	}
+	// 按interval对齐开始截止时间
+	totalRangeMs := endMS - startMs
+	dayNum := totalRangeMs / dayMSecs
+	tfMSecs := int64(tfSecs * 1000)
+	if dayNum >= 90 {
+		tfMSecs = dayMSecs
+	}
+	if totalRangeMs < minBackMSecs+intvMSecs {
+		return errors.New("order time range must > min-back + interval")
+	}
+	tf := utils2.SecsToTF(int(tfMSecs / 1000))
+	// 下载K线
+	if downKline {
+		prgTotal := 10000
+		pBar := utils.NewPrgBar(prgTotal, "BulkDown")
+		err = orm.BulkDownOHLCV(exg.Default, exsMap, tf, startMs, endMS, 0, func(done int, total int) {
+			newProgress := int64(prgTotal) * int64(done) / int64(total)
+			add := newProgress - pBar.Last
+			if add > 0 {
+				pBar.Last = newProgress
+				pBar.Add(int(add))
+			}
+		})
+		if err != nil {
+			return err
+		}
+	}
+	// 滚动测试因子
+	avgCost := totalCost / float64(validOdNum)
+	rangeStart := startMs
+	rangeEnd := startMs + minBackMSecs
+	var testOrders []*ormo.InOutOrder
+	for rangeEnd+intvMSecs/5 < endMS {
+		pairOrders, err := CutOrdersInRange(orders, rangeStart, rangeEnd)
+		if err != nil {
+			return err
+		}
+		pairInfos, err := CalcPairStats(pairOrders, rangeStart, rangeEnd, tf)
+		if err != nil {
+			return err
+		}
+		pairs, err_ := facFunc(FacArgs{
+			Pairs:        pairInfos,
+			AvgOrderCost: avgCost,
+			TimeFrame:    tf,
+			TFMSecs:      tfMSecs,
+			StartMS:      rangeStart,
+			EndMS:        rangeEnd,
+			MinBack:      minBack,
+			MinBackMS:    minBackMSecs,
+			MaxBack:      maxBack,
+			MaxBackMS:    maxBackMSecs,
+			Interval:     runPeriod,
+			IntervalMS:   intvMSecs,
+		})
+		if err_ != nil {
+			return err_
+		}
+		startDate := btime.ToDateStr(rangeStart, core.DefaultDateFmt)
+		endDate := btime.ToDateStr(rangeEnd, core.DefaultDateFmt)
+		rangeStr := fmt.Sprintf("%s-%s", startDate, endDate)
+		log.Info("select pairs", zap.String("range", rangeStr), zap.Strings("arr", pairs))
+		// 使用选中品种，交易interval时间段
+		pairOrders, err = CutOrdersInRange(orders, rangeEnd, rangeEnd+intvMSecs)
+		if err != nil {
+			return err
+		}
+		for _, s := range pairs {
+			if v, ok := pairOrders[s]; ok {
+				testOrders = append(testOrders, v...)
+			}
+		}
+		rangeEnd += intvMSecs
+		if rangeEnd-rangeStart > maxBackMSecs {
+			rangeStart = rangeEnd - maxBackMSecs
+		}
+	}
+	_, err = calcBtResult(testOrders, config.WalletAmounts, outDir)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func CutOrdersInRange(orders []*ormo.InOutOrder, startMS, endMS int64) (map[string][]*ormo.InOutOrder, *errs.Error) {
+	pairOrders := make(map[string][]*ormo.InOutOrder)
+	cloneIds := make(map[int64]bool)
+	for _, od := range orders {
+		enterMS := od.RealEnterMS()
+		exitMS := od.RealExitMS()
+		if enterMS >= endMS || exitMS > 0 && exitMS <= startMS {
+			continue
+		}
+		var curOd *ormo.InOutOrder
+		if enterMS >= startMS && exitMS <= endMS {
+			curOd = od
+		} else {
+			curOd = od.Clone()
+			cloneIds[curOd.ID] = true
+		}
+		items, _ := pairOrders[od.Symbol]
+		pairOrders[od.Symbol] = append(items, curOd)
+	}
+	for pair, items := range pairOrders {
+		tfMap := make(map[string]int)
+		minTF, minTfSecs := "", 0
+		for _, od := range items {
+			if _, ok := tfMap[od.Timeframe]; !ok {
+				secs := utils2.TFToSecs(od.Timeframe)
+				tfMap[od.Timeframe] = secs
+				if minTF == "" || secs < minTfSecs {
+					minTfSecs = secs
+					minTF = od.Timeframe
+				}
+			}
+		}
+		tfMSecs := int64(minTfSecs * 1000)
+		exs := orm.GetExSymbol2(core.ExgName, core.Market, pair)
+		_, bars, err := orm.GetOHLCV(exs, minTF, startMS, endMS, 1, false)
+		if err != nil {
+			return nil, err
+		}
+		if len(bars) == 0 {
+			continue
+		}
+		priceOpen := bars[0].Open
+		openMS := bars[0].Time
+		_, bars, err = orm.GetOHLCV(exs, minTF, 0, endMS, 1, false)
+		if err != nil {
+			return nil, err
+		}
+		if len(bars) == 0 {
+			return nil, errs.NewMsg(errs.CodeRunTime, "no kline before %v -%v", pair, endMS)
+		}
+		last := bars[len(bars)-1]
+		priceClose := last.Close
+		closeMS := last.Time + tfMSecs
+		for _, od := range items {
+			if _, ok := cloneIds[od.ID]; !ok {
+				continue
+			}
+			// 订单持仓超过时间区间，使用首尾价格重新计算
+			amtRate := float64(1)
+			if od.RealEnterMS() < openMS {
+				od.InitPrice = priceOpen
+				if od.Enter != nil {
+					curAmt := od.EnterCost() / priceOpen
+					amtRate = curAmt / od.Enter.Filled
+					od.Enter.Filled = curAmt
+					od.Enter.Amount = curAmt
+					od.Enter.CreateAt = openMS
+					od.Enter.UpdateAt = openMS
+					od.Enter.Price = priceOpen
+					od.Enter.Average = priceOpen
+				}
+			}
+			if od.Exit != nil {
+				if amtRate != 1 {
+					od.Exit.Amount *= amtRate
+					od.Exit.Filled *= amtRate
+				}
+				if od.RealExitMS() > closeMS {
+					od.Exit.CreateAt = closeMS
+					od.Exit.UpdateAt = closeMS
+					od.Exit.Price = priceClose
+					od.Exit.Average = priceClose
+				}
+			}
+			od.UpdateProfits(priceClose)
+		}
+	}
+	return pairOrders, nil
+}
+
+func BuildBtResult(args *config.CmdArgs) *errs.Error {
+	core.SetRunMode(core.RunModeBackTest)
+	if args.InPath == "" {
+		return errs.NewMsg(errs.CodeRunTime, "-in for orders.gob is required")
+	}
+	outDir := config.ParsePath(args.OutPath)
+	if outDir != "" {
+		err_ := utils.EnsureDir(outDir, 0755)
+		if err_ != nil {
+			return errs.New(errs.CodeIOWriteFail, err_)
+		}
+		core.SetLogCap(filepath.Join(outDir, "out.log"))
+	}
+	err := biz.SetupComsExg(args)
+	if err != nil {
+		return err
+	}
+	inPath := config.ParsePath(args.InPath)
+	orders, err := ormo.LoadOrdersGob(inPath)
+	if err != nil {
+		return err
+	}
+	_, err = calcBtResult(orders, config.WalletAmounts, outDir)
+	return err
 }
